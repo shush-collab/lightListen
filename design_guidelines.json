@@ -1,0 +1,225 @@
+{
+  "app_name": "LightListen",
+  "personality": "3 Editorial structure with 6 Glass / Luxe surfaces",
+  "personality_one_liner": "A cinematic, reader-focused sanctuary that seamlessly shifts between a warm, tactile bookish light mode and a deep, immersive glass-luxe dark mode.",
+  "color": {
+    "surface": "#F9F8F6",
+    "onSurface": "#1C1917",
+    "surfaceSecondary": "#F0ECE5",
+    "onSurfaceSecondary": "#44403C",
+    "surfaceTertiary": "#E6E0D8",
+    "onSurfaceTertiary": "#292524",
+    "surfaceInverse": "#1C1917",
+    "onSurfaceInverse": "#F9F8F6",
+    "brand": "#8C3A3A",
+    "brandPrimary": "#8C3A3A",
+    "onBrandPrimary": "#FFFFFF",
+    "brandSecondary": "#A45555",
+    "onBrandSecondary": "#FFFFFF",
+    "brandTertiary": "#EAD3D3",
+    "onBrandTertiary": "#5C2020",
+    "success": "#4A6741",
+    "onSuccess": "#FFFFFF",
+    "warning": "#B8860B",
+    "onWarning": "#FFFFFF",
+    "error": "#8B0000",
+    "onError": "#FFFFFF",
+    "info": "#4A5D67",
+    "onInfo": "#FFFFFF",
+    "border": "#E5E1DA",
+    "borderStrong": "#D1C9BE",
+    "divider": "#E5E1DA",
+    "dark_surface": "#0D0F12",
+    "dark_onSurface": "#F3F4F6",
+    "dark_surfaceSecondary": "#16191E",
+    "dark_onSurfaceSecondary": "#9CA3AF",
+    "dark_surfaceTertiary": "#1F2329",
+    "dark_onSurfaceTertiary": "#E5E7EB",
+    "dark_surfaceInverse": "#F9F8F6",
+    "dark_onSurfaceInverse": "#0D0F12",
+    "dark_brand": "#C5A059",
+    "dark_brandPrimary": "#C5A059",
+    "dark_onBrandPrimary": "#1A1406",
+    "dark_brandSecondary": "#A88444",
+    "dark_onBrandSecondary": "#1A1406",
+    "dark_brandTertiary": "#382B14",
+    "dark_onBrandTertiary": "#FCEEC7",
+    "dark_success": "#5C8051",
+    "dark_onSuccess": "#FFFFFF",
+    "dark_warning": "#D4A017",
+    "dark_onWarning": "#FFFFFF",
+    "dark_error": "#C23B22",
+    "dark_onError": "#FFFFFF",
+    "dark_info": "#607D8B",
+    "dark_onInfo": "#FFFFFF",
+    "dark_border": "#2A2F37",
+    "dark_borderStrong": "#3F4550",
+    "dark_divider": "#2A2F37"
+  },
+  "typography": {
+    "displayFontFamily": "Playfair Display",
+    "textFontFamily": "Satoshi",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Generous editorial spacing in Light mode; tight cinematic precision in Dark. Never cramp metadata.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": 1,
+  "navigation": "bottom_tabs",
+  "icon_set": "Feather",
+  "glassmorphism": {
+    "enabled": true,
+    "do's": [
+      "Use blur on the persistent mini-player.",
+      "Use blur on the tab bar.",
+      "Use blur on bottom sheets and modal overlays in Dark Mode.",
+      "Overlay glass controls on the full-screen audio player."
+    ],
+    "dont's": [
+      "Don't use glass on regular list items or standard cards.",
+      "Don't stack glass on top of glass.",
+      "Avoid glass in Light mode on data-dense screens; reserve it for Dark mode luxe moments."
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-glass-effect",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler",
+    "audio": "expo-audio"
+  },
+  "screens": [
+    {
+      "name": "Home",
+      "purpose": "Discover new audiobooks and immediately resume playback.",
+      "states": {
+        "loading": "Skeleton cards with soft shimmer.",
+        "empty": "No items? Show a stylized illustration inviting users to Explore.",
+        "error": "Readable text with retry button inside a centered flex container."
+      },
+      "layout": "Header with 'LightListen' wordmark (Playfair Display) and Avatar. Horizontal scroll (padding horizontal lg) for 'Continue Listening' showing large hero cards with progress bars. Below, vertical lists or 2-col grids for 'New This Week' and 'Popular'. End with a glass-tinted banner previewing 'Community Requests'."
+    },
+    {
+      "name": "Explore",
+      "purpose": "Search and filter the curated catalog.",
+      "states": {
+        "loading": "Spinner centered on surface.",
+        "empty": "No results for search query. Illustration + 'Try a different keyword'.",
+        "error": "Error fetching catalog."
+      },
+      "layout": "Sticky search bar at the top (surfaceTertiary bg). Scrollable row of pill-shaped genre filters beneath. 2-col grid for novel results. Ensure bottom padding accounts for the sticky mini-player."
+    },
+    {
+      "name": "Novel Detail",
+      "purpose": "Display novel metadata, volumes, and chapter tracklist.",
+      "states": {
+        "loading": "Cover skeleton and line skeletons for metadata.",
+        "empty": "N/A (Always data driven)",
+        "error": "Error fetching novel details."
+      },
+      "layout": "Hero image at top with a vertical gradient scrim (transparent to surface). Large Playfair Display title and Satoshi author name on top of the scrim. A sticky Primary CTA button ('Play Chapter 1') that docks below the header on scroll. Below, horizontal volume tabs, followed by a vertical list of chapters. Each chapter row includes chapter number, duration, and a download icon button."
+    },
+    {
+      "name": "Audio Player (Fullscreen)",
+      "purpose": "Immersive, distraction-free playback control.",
+      "states": {
+        "loading": "Buffering spinner inside the play button.",
+        "empty": "N/A",
+        "error": "Error loading audio stream."
+      },
+      "layout": "Full screen modal. Large centered square artwork. Title and author text. A fluid, thick scrub bar. Playback controls grouped tightly (speed, prev, play/pause, next, sleep timer). Use an atmospheric blurred background derived from the cover art (expo-image blurRadius)."
+    },
+    {
+      "name": "Library",
+      "purpose": "Manage user's personal collection and downloads.",
+      "states": {
+        "loading": "Spinner.",
+        "empty": "Illustration + 'Your library is empty. Start exploring!'",
+        "error": "Failed to load library."
+      },
+      "layout": "Top material-style tabs (Continue, Saved, Downloads). List layout for items. The 'Downloads' tab must display local storage sizes (e.g., '120 MB') and trash icon actions to delete."
+    },
+    {
+      "name": "Community Requests",
+      "purpose": "Allow users to request and vote on new novels.",
+      "states": {
+        "loading": "Skeleton rows.",
+        "empty": "No requests found for query. Prompt to 'Create New Request'.",
+        "error": "Failed to fetch requests."
+      },
+      "layout": "Search input at top. List of existing requests (Title + vote count + status badge). Status badges use structural colors (success, warning, info) with subtle background tints. Add a floating action button (FAB) for 'New Request'."
+    },
+    {
+      "name": "Profile",
+      "purpose": "Account settings, storage management, and theme configuration.",
+      "states": {
+        "loading": "Spinner.",
+        "empty": "N/A",
+        "error": "Failed to load profile."
+      },
+      "layout": "List of setting rows. Prominent 'Theme Switcher' segmented control (Light Bookish / Dark Cinematic). Storage management section showing a progress bar of used space. A visually distinct 'Pro' banner (Coming Soon) using brand gradients or glass to look premium. Logout button at bottom."
+    }
+  ],
+  "images": {
+    "splash_bg": {
+      "url": "https://images.pexels.com/photos/13968194/pexels-photo-13968194.jpeg",
+      "dark": "https://images.unsplash.com/photo-1513346940221-6f673d962e97?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2NDN8MHwxfHNlYXJjaHwxfHxkYXJrJTIwY2luZW1hdGljJTIwdGV4dHVyZSUyMGdvbGR8ZW58MHx8fHwxNzg4MDcyOTIyfDA&ixlib=rb-4.1.0&q=85",
+      "alt": "Atmospheric background texture"
+    },
+    "novel_cover_1": {
+      "url": "https://images.pexels.com/photos/10109585/pexels-photo-10109585.jpeg",
+      "alt": "Surreal abstract landscape"
+    },
+    "novel_cover_2": {
+      "url": "https://images.pexels.com/photos/14332269/pexels-photo-14332269.jpeg",
+      "alt": "Foggy forest sunrise"
+    },
+    "novel_cover_3": {
+      "url": "https://images.pexels.com/photos/207130/pexels-photo-207130.jpeg",
+      "alt": "Moonlit mountain landscape"
+    }
+  },
+  "haptics": {
+    "play_pause": "impactLight",
+    "seek": "selection",
+    "chapter_skip": "impactMedium",
+    "download_start": "impactMedium",
+    "vote_request": "impactLight",
+    "theme_switch": "impactHeavy",
+    "tab_change": "selection"
+  },
+  "instructions_to_main_agent": [
+    "IMPLEMENT THEME SWITCHING: The user explicitly requested two distinct themes ('Light, warm bookish' and 'Dark, cinematic reader-focused'). Use the standard `color` properties for Light mode and the `dark_*` properties for Dark mode. Build a ThemeProvider that toggles these.",
+    "PERSISTENT MINI-PLAYER: Must sit above the bottom navigation tabs across Home, Explore, and Library. Use `expo-blur` for its background to create a glass effect. Ensure underlying scroll views (lists/grids) have bottom padding so the last item isn't hidden by the mini-player.",
+    "AUDIO PLAYER: Use `expo-audio`. Build a dedicated full-screen modal that opens when the mini-player is tapped. This modal should feature large artwork with a blurred backdrop of the artwork.",
+    "FONT HIERARCHY: Use 'Playfair Display' for high-impact titles (novel titles, screen headers) and 'Satoshi' for body text, metadata, buttons, and chapter lists.",
+    "MOCK IMAGES: Use the provided Pexels links in the `images` object for sample novel covers in the MVP to simulate a real catalog.",
+    "SCRIM GRADIENT: Any text overlaid on cover images (like the Novel Detail hero section) MUST have a vertical gradient scrim behind it (transparent at top, 70-100% surface at bottom) to ensure WCAG text contrast.",
+    "HAPTICS: Implement haptic feedback per the `haptics` object above. The interactions on the audio player (play, pause, seek) should feel tactile."
+  ]
+}

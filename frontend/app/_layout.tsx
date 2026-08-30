@@ -1,24 +1,54 @@
 import { useFonts } from "expo-font";
-import { Stack } from "expo-router";
+import * as Linking from "expo-linking";
+import * as Notifications from "expo-notifications";
+import { Stack, useRouter } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
-import React, { useEffect } from "react";
-import { LogBox, StyleSheet, View } from "react-native";
+import React, { useEffect, useState } from "react";
+import { LogBox, Platform, StyleSheet, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { MiniPlayer } from "@/src/components/MiniPlayer";
-import { AuthProvider } from "@/src/context/AuthContext";
+import { PushNudge } from "@/src/components/PushNudge";
+import { AuthProvider, useAuth } from "@/src/context/AuthContext";
 import { DownloadsProvider } from "@/src/context/DownloadsContext";
 import { PlayerProvider } from "@/src/context/PlayerContext";
 import { ToastProvider } from "@/src/context/ToastContext";
 import { useIconFonts } from "@/src/hooks/use-icon-fonts";
+import { refreshPushRegistration } from "@/src/push";
 import { ThemeProvider, useTheme } from "@/src/theme/ThemeProvider";
+import { storage } from "@/src/utils/storage";
 
 // Disable logbox errors etc so that users can see the app
 // and agent works as expected.
 LogBox.ignoreAllLogs(true);
+
+// Foreground presentation — module scope, before any component renders.
+if (Platform.OS !== "web") {
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowAlert: true,
+      shouldShowBanner: true,
+      shouldShowList: true,
+      shouldPlaySound: true,
+      shouldSetBadge: false,
+    }),
+  });
+}
+
+// Android channel must exist before the first push arrives.
+if (Platform.OS === "android") {
+  Notifications.setNotificationChannelAsync("default", {
+    name: "Default",
+    importance: Notifications.AndroidImportance.MAX,
+    sound: "default",
+  });
+}
+
+const NUDGE_KEY = "lightlisten.pushNudgeAt";
+const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Keep the native splash visible from cold start until icon fonts register.
 // Required because @expo/vector-icons' componentDidMount fallback fires
@@ -28,6 +58,59 @@ SplashScreen.preventAutoHideAsync();
 
 function Shell() {
   const { colors, isDark } = useTheme();
+  const router = useRouter();
+  const { user } = useAuth();
+  const [nudge, setNudge] = useState(false);
+
+  // Device tokens rotate — re-register whenever we have a signed-in user.
+  useEffect(() => {
+    if (user) void refreshPushRegistration();
+  }, [user]);
+
+  useEffect(() => {
+    if (Platform.OS === "web") return;
+
+    const openTarget = (data: Record<string, unknown> | undefined) => {
+      const url = (data?.deeplink ?? data?.action_url) as string | undefined;
+      if (!url) return;
+      if (url.startsWith("http")) void Linking.openURL(url);
+      else router.push(url as never);
+    };
+
+    // Warm tap — app already open.
+    const tapSub = Notifications.addNotificationResponseReceivedListener((response) => {
+      openTarget(response.notification.request.content.data as Record<string, unknown>);
+    });
+
+    // Cold start — app was killed when the notification was tapped.
+    void Notifications.getLastNotificationResponseAsync().then((response) => {
+      if (!response) return;
+      openTarget(response.notification.request.content.data as Record<string, unknown>);
+    });
+
+    // Weekly nudge for permanently denied permission (the OS will not re-prompt).
+    void (async () => {
+      try {
+        const { status, canAskAgain } = await Notifications.getPermissionsAsync();
+        if (status !== "denied" || canAskAgain) return;
+        const last = await storage.getItem<string>(NUDGE_KEY, "");
+        if (last && Date.now() - Number(last) <= ONE_WEEK_MS) return;
+        setNudge(true);
+      } catch {
+        /* ignore */
+      }
+    })();
+
+    return () => {
+      tapSub.remove();
+    };
+  }, [router]);
+
+  const dismissNudge = () => {
+    setNudge(false);
+    void storage.setItem(NUDGE_KEY, String(Date.now()));
+  };
+
   return (
     <View style={[styles.root, { backgroundColor: colors.surface }]}>
       <StatusBar style={isDark ? "light" : "dark"} />
@@ -51,6 +134,7 @@ function Shell() {
         <Stack.Screen name="pro" />
       </Stack>
       <MiniPlayer />
+      <PushNudge visible={nudge} onDismiss={dismissNudge} />
     </View>
   );
 }

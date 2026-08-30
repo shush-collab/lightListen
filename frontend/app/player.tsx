@@ -4,9 +4,10 @@ import * as Haptics from "expo-haptics";
 import { Image } from "expo-image";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
-import React, { useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -16,9 +17,12 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { resolveMediaUrl } from "@/src/api/client";
+import { api, resolveMediaUrl } from "@/src/api/client";
+import type { Bookmark } from "@/src/api/types";
+import { track as trackEvent } from "@/src/analytics";
 import { Sheet } from "@/src/components/Sheet";
 import { SPEEDS, SleepOption, usePlayer, usePlayerStatus } from "@/src/context/PlayerContext";
+import { useToast } from "@/src/context/ToastContext";
 import { useTheme } from "@/src/theme/ThemeProvider";
 import { fonts, fontSize, formatDuration, radius, spacing } from "@/src/theme/tokens";
 
@@ -35,6 +39,7 @@ export default function PlayerScreen() {
   const { colors, isDark } = useTheme();
   const insets = useSafeAreaInsets();
   const router = useRouter();
+  const toast = useToast();
   const {
     novel,
     chapter,
@@ -58,6 +63,67 @@ export default function PlayerScreen() {
   const [speedSheet, setSpeedSheet] = useState(false);
   const [sleepSheet, setSleepSheet] = useState(false);
   const [chapterSheet, setChapterSheet] = useState(false);
+  const [bookmarkSheet, setBookmarkSheet] = useState(false);
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [illustrationOpen, setIllustrationOpen] = useState(false);
+
+  const novelId = novel?.id ?? null;
+
+  const loadBookmarks = useCallback(async () => {
+    if (!novelId) return;
+    try {
+      setBookmarks(await api.bookmarks(novelId));
+    } catch {
+      /* offline */
+    }
+  }, [novelId]);
+
+  useEffect(() => {
+    void loadBookmarks();
+  }, [loadBookmarks]);
+
+  // The most recent illustration whose cue has already passed.
+  const currentIllustration = useMemo(() => {
+    const list = chapter?.illustrations ?? [];
+    if (list.length === 0) return null;
+    const passed = list.filter((item) => item.timestamp_seconds <= position);
+    return passed.length > 0 ? passed[passed.length - 1] : null;
+  }, [chapter, position]);
+
+  const addBookmark = async () => {
+    if (!novel || !chapter) return;
+    if (Platform.OS !== "web") void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    try {
+      const created = await api.createBookmark(novel.id, chapter.id, Math.floor(position));
+      trackEvent("bookmark_created", { novel_id: novel.id, chapter_id: chapter.id });
+      setBookmarks((prev) =>
+        prev.some((b) => b.id === created.id) ? prev : [created, ...prev],
+      );
+      toast(`Bookmarked at ${formatDuration(created.position_seconds)}`, "success");
+    } catch {
+      toast("Could not save this bookmark", "error");
+    }
+  };
+
+  const openBookmark = (bookmark: Bookmark) => {
+    setBookmarkSheet(false);
+    if (!novel) return;
+    if (bookmark.chapter_id === chapter?.id) {
+      seekTo(bookmark.position_seconds);
+      return;
+    }
+    const index = (track?.chapters ?? []).findIndex((c) => c.id === bookmark.chapter_id);
+    if (index >= 0) playChapter(novel, track?.chapters ?? [], index, bookmark.position_seconds);
+  };
+
+  const removeBookmark = async (bookmark: Bookmark) => {
+    try {
+      await api.deleteBookmark(bookmark.id);
+      setBookmarks((prev) => prev.filter((b) => b.id !== bookmark.id));
+    } catch {
+      toast("Could not remove the bookmark", "error");
+    }
+  };
 
   if (!novel || !chapter) {
     return (
@@ -126,6 +192,14 @@ export default function PlayerScreen() {
             </View>
           ) : null}
         </View>
+        <Pressable
+          testID="player-bookmark-add"
+          onPress={addBookmark}
+          hitSlop={10}
+          style={[styles.circle, { backgroundColor: colors.surfaceSecondary }]}
+        >
+          <Feather name="bookmark" size={18} color={colors.brand} />
+        </Pressable>
         <Pressable
           testID="player-chapters"
           onPress={() => setChapterSheet(true)}
@@ -249,6 +323,23 @@ export default function PlayerScreen() {
           </Pressable>
         </View>
 
+        {currentIllustration ? (
+          <Pressable
+            testID="player-illustration-button"
+            onPress={() => setIllustrationOpen(true)}
+            style={[
+              styles.illustration,
+              { backgroundColor: colors.brandTertiary, borderColor: colors.brand },
+            ]}
+          >
+            <Feather name="image" size={15} color={colors.onBrandTertiary} />
+            <Text numberOfLines={1} style={[styles.illustrationText, { color: colors.onBrandTertiary }]}>
+              {currentIllustration.caption ?? "View illustration"}
+            </Text>
+            <Feather name="chevron-right" size={15} color={colors.onBrandTertiary} />
+          </Pressable>
+        ) : null}
+
         <View style={styles.extras}>
           <Pressable
             testID="player-speed-button"
@@ -276,6 +367,19 @@ export default function PlayerScreen() {
                 : typeof sleep === "number" && sleepRemaining
                   ? formatDuration(sleepRemaining)
                   : "Sleep timer"}
+            </Text>
+          </Pressable>
+          <Pressable
+            testID="player-bookmarks-button"
+            onPress={() => {
+              void loadBookmarks();
+              setBookmarkSheet(true);
+            }}
+            style={[styles.pill, { backgroundColor: colors.surfaceSecondary, borderColor: colors.border }]}
+          >
+            <Feather name="bookmark" size={14} color={colors.brand} />
+            <Text style={[styles.pillText, { color: colors.onSurface }]}>
+              Bookmarks{bookmarks.length > 0 ? ` · ${bookmarks.length}` : ""}
             </Text>
           </Pressable>
         </View>
@@ -362,6 +466,77 @@ export default function PlayerScreen() {
           </Pressable>
         ))}
       </Sheet>
+
+      <Sheet
+        testID="bookmarks-sheet"
+        visible={bookmarkSheet}
+        onClose={() => setBookmarkSheet(false)}
+        title="Bookmarks"
+        scroll
+      >
+        {bookmarks.length === 0 ? (
+          <Text style={[styles.emptyBookmark, { color: colors.onSurfaceSecondary }]}>
+            No bookmarks yet. Tap the bookmark icon while listening to save the exact moment.
+          </Text>
+        ) : (
+          bookmarks.map((bookmark) => (
+            <View key={bookmark.id} style={[styles.option, { borderColor: colors.divider }]}>
+              <Pressable
+                testID={`bookmark-open-${bookmark.id}`}
+                onPress={() => openBookmark(bookmark)}
+                style={styles.optionBody}
+              >
+                <Text numberOfLines={1} style={[styles.optionText, { color: colors.onSurface }]}>
+                  Chapter {bookmark.chapter_number ?? "?"} · {formatDuration(bookmark.position_seconds)}
+                </Text>
+                <Text numberOfLines={1} style={[styles.optionMeta, { color: colors.onSurfaceSecondary }]}>
+                  {bookmark.chapter_title ?? ""}
+                </Text>
+              </Pressable>
+              <Pressable
+                testID={`bookmark-delete-${bookmark.id}`}
+                onPress={() => void removeBookmark(bookmark)}
+                hitSlop={8}
+                style={styles.bookmarkDelete}
+              >
+                <Feather name="trash-2" size={16} color={colors.error} />
+              </Pressable>
+            </View>
+          ))
+        )}
+      </Sheet>
+
+      <Modal
+        visible={illustrationOpen && Boolean(currentIllustration)}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setIllustrationOpen(false)}
+      >
+        <Pressable
+          testID="illustration-modal"
+          style={styles.imageBackdrop}
+          onPress={() => setIllustrationOpen(false)}
+        >
+          <Image
+            source={{ uri: resolveMediaUrl(currentIllustration?.image_url) ?? "" }}
+            style={styles.fullImage}
+            contentFit="contain"
+            transition={200}
+          />
+          {currentIllustration?.caption ? (
+            <Text style={[styles.imageCaption, { color: "#F3F4F6" }]}>
+              {currentIllustration.caption}
+            </Text>
+          ) : null}
+          <Pressable
+            testID="illustration-close"
+            onPress={() => setIllustrationOpen(false)}
+            style={[styles.imageClose, { top: insets.top + spacing.md }]}
+          >
+            <Feather name="x" size={22} color="#F3F4F6" />
+          </Pressable>
+        </Pressable>
+      </Modal>
     </View>
   );
 }
@@ -446,4 +621,37 @@ const styles = StyleSheet.create({
   optionBody: { flex: 1, gap: 2 },
   optionText: { fontFamily: fonts.medium, fontSize: fontSize.lg },
   optionMeta: { fontFamily: fonts.regular, fontSize: fontSize.sm },
+  illustration: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    alignSelf: "stretch",
+    minHeight: 48,
+    paddingHorizontal: spacing.lg,
+    borderRadius: radius.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  illustrationText: { flex: 1, fontFamily: fonts.semibold, fontSize: fontSize.base },
+  emptyBookmark: {
+    fontFamily: fonts.regular,
+    fontSize: fontSize.base,
+    lineHeight: 20,
+    paddingVertical: spacing.md,
+  },
+  bookmarkDelete: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+  imageBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.94)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: spacing.lg,
+  },
+  fullImage: { width: "100%", height: "80%" },
+  imageCaption: {
+    fontFamily: fonts.regular,
+    fontSize: fontSize.base,
+    textAlign: "center",
+    marginTop: spacing.lg,
+  },
+  imageClose: { position: "absolute", right: spacing.lg, width: 44, height: 44, alignItems: "center", justifyContent: "center" },
 });

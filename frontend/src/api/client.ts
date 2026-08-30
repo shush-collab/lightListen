@@ -1,6 +1,8 @@
 import { storage } from "@/src/utils/storage";
 
 import type {
+  Bookmark,
+  CatchUp,
   Chapter,
   CommunityRequest,
   ContinueItem,
@@ -164,6 +166,35 @@ export const api = {
     request<CommunityRequest>("/requests", { method: "POST", body: { title, alt_title } }),
   vote: (id: string) => request<CommunityRequest>(`/requests/${id}/vote`, { method: "POST" }),
   myRequests: () => request<CommunityRequest[]>("/me/requests"),
+
+  // chapter completion
+  completeChapter: (chapterId: string) =>
+    request<{ completed: boolean }>(`/me/chapters/${chapterId}/complete`, { method: "POST" }),
+  completedChapters: (novelId: string) =>
+    request<{ chapter_ids: string[] }>(`/me/novels/${novelId}/completed`),
+
+  // timestamp bookmarks
+  createBookmark: (novel_id: string, chapter_id: string, position_seconds: number) =>
+    request<Bookmark>("/me/bookmarks", {
+      method: "POST",
+      body: { novel_id, chapter_id, position_seconds },
+    }),
+  bookmarks: (novelId: string) => request<Bookmark[]>(`/me/novels/${novelId}/bookmarks`),
+  deleteBookmark: (bookmarkId: string) =>
+    request<{ deleted: boolean }>(`/me/bookmarks/${bookmarkId}`, { method: "DELETE" }),
+
+  // spoiler-safe recap
+  catchup: (novelId: string) => request<CatchUp>(`/me/novels/${novelId}/catchup`),
+
+  // analytics + push
+  trackEvent: (payload: {
+    event: string;
+    novel_id?: string;
+    chapter_id?: string;
+    properties?: Record<string, unknown>;
+  }) => request<{ ok: boolean }>("/events", { method: "POST", body: payload }),
+  registerPush: (payload: { platform: string; device_token: string }) =>
+    request<{ status: string }>("/register-push", { method: "POST", body: payload }),
 
   pro: () => request<{ status: string; features: ProFeature[] }>("/pro/features", { auth: false }),
 };

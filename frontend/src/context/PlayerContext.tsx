@@ -11,6 +11,7 @@ import React, {
 
 import { api, resolveMediaUrl } from "@/src/api/client";
 import type { Chapter, Novel } from "@/src/api/types";
+import { track as trackEvent } from "@/src/analytics";
 
 import { useDownloads } from "./DownloadsContext";
 
@@ -27,6 +28,8 @@ type PlayerActions = {
   sleep: SleepOption;
   sleepRemaining: number | null;
   isOffline: boolean;
+  /** Bumps whenever a chapter is marked completed, so screens can refresh their ticks. */
+  completionTick: number;
   playChapter: (novel: Novel, chapters: Chapter[], index: number, startAt?: number) => void;
   togglePlay: () => void;
   next: () => void;
@@ -54,6 +57,7 @@ const ActionsContext = createContext<PlayerActions>({
   sleep: null,
   sleepRemaining: null,
   isOffline: false,
+  completionTick: 0,
   playChapter: () => {},
   togglePlay: () => {},
   next: () => {},
@@ -78,13 +82,14 @@ const SAVE_INTERVAL_MS = 12000;
 export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const player = useAudioPlayer(null, { updateInterval: 500 });
   const status = useAudioPlayerStatus(player);
-  const { getLocalUri } = useDownloads();
+  const { getLocalUri, downloadMany, pruneSmart, autoDownloadNext } = useDownloads();
 
   const [track, setTrack] = useState<Track | null>(null);
   const [rate, setRateState] = useState(1);
   const [sleep, setSleepState] = useState<SleepOption>(null);
   const [sleepRemaining, setSleepRemaining] = useState<number | null>(null);
   const [isOffline, setIsOffline] = useState(false);
+  const [completionTick, setCompletionTick] = useState(0);
 
   const pendingSeek = useRef<number | null>(null);
   const lastSave = useRef(0);
@@ -191,6 +196,17 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!status.didJustFinish || finishGuard.current) return;
     finishGuard.current = true;
+
+    // Reaching the end of the audio is the ONLY thing that counts as completed —
+    // scrubbing to 99% deliberately does not.
+    const current = trackRef.current;
+    const finished = current?.chapters[current.index];
+    if (current && finished) {
+      void api.completeChapter(finished.id).catch(() => undefined);
+      trackEvent("chapter_completed", { novel_id: current.novel.id, chapter_id: finished.id });
+      setCompletionTick((tick) => tick + 1);
+    }
+
     persistProgress(true);
     if (sleep === "chapter") {
       player.pause();
@@ -199,6 +215,24 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     }
     next();
   }, [status.didJustFinish, sleep, next, persistProgress, player]);
+
+  // Chapter-start analytics + rolling smart cache of the upcoming chapters.
+  const currentChapterId = track?.chapters[track.index]?.id ?? null;
+  useEffect(() => {
+    const current = trackRef.current;
+    if (!current || !currentChapterId) return;
+    trackEvent("chapter_started", { novel_id: current.novel.id, chapter_id: currentChapterId });
+
+    const upcoming =
+      autoDownloadNext > 0
+        ? current.chapters.slice(current.index + 1, current.index + 1 + autoDownloadNext)
+        : [];
+    if (upcoming.length > 0) {
+      void downloadMany(current.novel, upcoming, "smart").catch(() => undefined);
+    }
+    // Keep the chapter playing right now plus the look-ahead window; drop older smart files.
+    void pruneSmart([currentChapterId, ...upcoming.map((c) => c.id)]).catch(() => undefined);
+  }, [currentChapterId, autoDownloadNext, downloadMany, pruneSmart]);
 
   // Countdown sleep timer.
   useEffect(() => {
@@ -289,6 +323,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       sleep,
       sleepRemaining,
       isOffline,
+      completionTick,
       playChapter,
       togglePlay,
       next,
@@ -306,6 +341,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       sleep,
       sleepRemaining,
       isOffline,
+      completionTick,
       playChapter,
       togglePlay,
       next,

@@ -13,11 +13,20 @@ type Props = {
   index: number;
   isCurrent: boolean;
   isPlaying: boolean;
+  isCompleted?: boolean;
   onPress: () => void;
   onDownload: () => void;
 };
 
-export function ChapterRow({ chapter, index, isCurrent, isPlaying, onPress, onDownload }: Props) {
+export function ChapterRow({
+  chapter,
+  index,
+  isCurrent,
+  isPlaying,
+  isCompleted = false,
+  onPress,
+  onDownload,
+}: Props) {
   const { colors } = useTheme();
   const { getRecord, supported } = useDownloads();
   const record = getRecord(chapter.id);
@@ -56,9 +65,22 @@ export function ChapterRow({ chapter, index, isCurrent, isPlaying, onPress, onDo
         }}
         style={styles.main}
       >
-        <View style={[styles.number, { borderColor: isCurrent ? colors.brand : colors.border }]}>
+        <View
+          style={[
+            styles.number,
+            {
+              borderColor: isCurrent
+                ? colors.brand
+                : isCompleted
+                  ? colors.success
+                  : colors.border,
+            },
+          ]}
+        >
           {isCurrent && isPlaying ? (
             <Feather name="volume-2" size={14} color={colors.brand} />
+          ) : isCompleted ? (
+            <Feather name="check" size={15} color={colors.success} />
           ) : (
             <Text
               style={[styles.numberText, { color: isCurrent ? colors.brand : colors.onSurfaceSecondary }]}

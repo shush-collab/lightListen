@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional
 
 import bcrypt
+import httpx
 import jwt
 import requests
 from bson import ObjectId
@@ -65,6 +66,31 @@ APP_NAME = "lightlisten"
 STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
 STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
 EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY")
+
+# Emergent managed push relay (tokens are resolved upstream from the user id).
+PUSH_BASE_URL = "https://integrations.emergentagent.com"
+PUSH_KEY = os.environ.get("EMERGENT_PUSH_KEY", "placeholder")
+
+# Only these analytics event names are accepted — keeps the collection clean.
+ALLOWED_EVENTS = {
+    "novel_viewed",
+    "chapter_started",
+    "chapter_completed",
+    "anime_continue_used",
+    "catchup_used",
+    "bookmark_created",
+    "download_started",
+    "download_completed",
+    "request_submitted",
+    "request_voted",
+}
+
+# A recap is only offered after this many days away from a novel.
+CATCHUP_MIN_DAYS = 3
+CATCHUP_MAX_CHAPTERS = 5
+CATCHUP_MIN_WORDS = 80
+CATCHUP_MAX_WORDS = 120
+BOOKMARK_DEDUPE_SECONDS = 3.0
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -167,6 +193,11 @@ class Novel(BaseDocument):
     play_count: int = 0
     chapter_count: int = 0
     total_duration_seconds: int = 0
+    # Curated "continue from the anime" jump points.
+    anime_mappings: List[Dict[str, Any]] = []
+    # Narration casting manifest — admin-only, never exposed in full publicly.
+    narration_mode: str = "single"
+    cast: List[Dict[str, Any]] = []
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
 
@@ -186,6 +217,10 @@ class Chapter(BaseDocument):
     audio_file_url: str
     duration_seconds: int = 0
     file_size_bytes: int = 0
+    # Timeline-synced light novel illustrations.
+    illustrations: List[Dict[str, Any]] = []
+    # Spoiler-safe summary of THIS chapter, only served through /catchup.
+    recap_text: str = ""
     created_at: datetime = Field(default_factory=now_utc)
 
 
@@ -235,6 +270,30 @@ class Subscription(BaseDocument):
     starts_at: datetime = Field(default_factory=now_utc)
     expires_at: Optional[datetime] = None
     status: str = "active"
+
+
+class ChapterCompletion(BaseDocument):
+    user_id: PyObjectId
+    novel_id: PyObjectId
+    chapter_id: PyObjectId
+    completed_at: datetime = Field(default_factory=now_utc)
+
+
+class AudioBookmark(BaseDocument):
+    user_id: PyObjectId
+    novel_id: PyObjectId
+    chapter_id: PyObjectId
+    position_seconds: float
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class AnalyticsEvent(BaseDocument):
+    user_id: Optional[PyObjectId] = None
+    event: str
+    novel_id: Optional[PyObjectId] = None
+    chapter_id: Optional[PyObjectId] = None
+    properties: Dict[str, Any] = {}
+    created_at: datetime = Field(default_factory=now_utc)
 
 
 # ------------------------------------------------------------ request/response
@@ -294,6 +353,7 @@ class ChapterPatchBody(BaseModel):
     chapter_number: Optional[int] = None
     title: Optional[str] = None
     duration_seconds: Optional[int] = None
+    recap_text: Optional[str] = None
 
 
 class AdminRequestPatchBody(BaseModel):
@@ -302,6 +362,47 @@ class AdminRequestPatchBody(BaseModel):
     cover_image_url: Optional[str] = None
     genres: Optional[List[str]] = None
     linked_novel_id: Optional[str] = None
+
+
+class BookmarkBody(BaseModel):
+    novel_id: str
+    chapter_id: str
+    position_seconds: float = Field(default=0, ge=0)
+
+
+class AnimeMappingBody(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    through_episode: Optional[int] = Field(default=None, ge=0)
+    continue_chapter_id: str
+    note: Optional[str] = Field(default=None, max_length=280)
+
+
+class AnimeMappingsBody(BaseModel):
+    mappings: List[AnimeMappingBody] = []
+
+
+class CastMemberBody(BaseModel):
+    character: str = Field(min_length=1, max_length=80)
+    provider: Optional[str] = Field(default=None, max_length=60)
+    voice_id: Optional[str] = Field(default=None, max_length=120)
+    voice_label: Optional[str] = Field(default=None, max_length=120)
+
+
+class CastBody(BaseModel):
+    narration_mode: str = Field(default="single", pattern="^(single|dual|full_cast)$")
+    cast: List[CastMemberBody] = []
+
+
+class EventBody(BaseModel):
+    event: str = Field(min_length=1, max_length=60)
+    novel_id: Optional[str] = None
+    chapter_id: Optional[str] = None
+    properties: Dict[str, Any] = {}
+
+
+class RegisterPushBody(BaseModel):
+    platform: str = Field(min_length=1, max_length=20)
+    device_token: str = Field(min_length=1, max_length=500)
 
 
 # ---------------------------------------------------------------- helpers
@@ -424,12 +525,33 @@ def novel_out(doc: dict) -> dict:
         "play_count": doc.get("play_count", 0),
         "chapter_count": doc.get("chapter_count", 0),
         "total_duration_seconds": doc.get("total_duration_seconds", 0),
+        "anime_mappings": [
+            {
+                "label": m.get("label", ""),
+                "through_episode": m.get("through_episode"),
+                "continue_chapter_id": str(m.get("continue_chapter_id"))
+                if m.get("continue_chapter_id")
+                else None,
+                "note": m.get("note"),
+            }
+            for m in doc.get("anime_mappings", [])
+        ],
+        "narration_mode": doc.get("narration_mode", "single"),
+        "cast_count": len(doc.get("cast", [])),
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
     }
 
 
+def admin_novel_out(doc: dict) -> dict:
+    """Same as `novel_out` plus the internal casting manifest (voice ids)."""
+    return {**novel_out(doc), "cast": doc.get("cast", [])}
+
+
 def chapter_out(doc: dict) -> dict:
+    illustrations = sorted(
+        doc.get("illustrations", []), key=lambda item: item.get("timestamp_seconds", 0)
+    )
     return {
         "id": str(doc["_id"]),
         "novel_id": str(doc["novel_id"]),
@@ -439,8 +561,21 @@ def chapter_out(doc: dict) -> dict:
         "audio_file_url": doc.get("audio_file_url", ""),
         "duration_seconds": doc.get("duration_seconds", 0),
         "file_size_bytes": doc.get("file_size_bytes", 0),
+        "illustrations": illustrations,
         "created_at": doc.get("created_at"),
     }
+
+
+def admin_chapter_out(doc: dict) -> dict:
+    """Same as `chapter_out` plus the spoiler-bearing recap text."""
+    return {**chapter_out(doc), "recap_text": doc.get("recap_text", "")}
+
+
+def days_since(value: Optional[datetime]) -> Optional[float]:
+    if not value:
+        return None
+    aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return (now_utc() - aware).total_seconds() / 86400
 
 
 def request_out(doc: dict, user_id: Optional[str]) -> dict:
@@ -766,6 +901,184 @@ async def unsave_novel(novel_id: str, user: dict = Depends(current_user)):
     return {"saved": False}
 
 
+# ---------------------------------------------------------------- chapter completion
+@api_router.post("/me/chapters/{chapter_id}/complete")
+async def complete_chapter(chapter_id: str, user: dict = Depends(current_user)):
+    cid = oid(chapter_id, "chapter id")
+    chapter = await db.chapters.find_one({"_id": cid})
+    if not chapter:
+        raise HTTPException(404, "Chapter not found")
+    novel = await db.novels.find_one({"_id": chapter["novel_id"], "status": "published"})
+    if not novel:
+        raise HTTPException(404, "Chapter not found")
+    await db.chapter_completions.update_one(
+        {"user_id": user["_id"], "chapter_id": cid},
+        {
+            "$set": {"novel_id": chapter["novel_id"]},
+            "$setOnInsert": {"completed_at": now_utc()},
+        },
+        upsert=True,
+    )
+    return {"completed": True}
+
+
+@api_router.get("/me/novels/{novel_id}/completed")
+async def completed_chapters(novel_id: str, user: dict = Depends(current_user)):
+    nid = oid(novel_id, "novel id")
+    rows = await db.chapter_completions.find(
+        {"user_id": user["_id"], "novel_id": nid}
+    ).to_list(5000)
+    return {"chapter_ids": [str(row["chapter_id"]) for row in rows]}
+
+
+# ---------------------------------------------------------------- timestamp bookmarks
+def bookmark_out(doc: dict, chapter: Optional[dict] = None) -> dict:
+    return {
+        "id": str(doc["_id"]),
+        "novel_id": str(doc["novel_id"]),
+        "chapter_id": str(doc["chapter_id"]),
+        "position_seconds": doc.get("position_seconds", 0),
+        "chapter_number": (chapter or {}).get("chapter_number"),
+        "chapter_title": (chapter or {}).get("title"),
+        "created_at": doc.get("created_at"),
+    }
+
+
+@api_router.post("/me/bookmarks", status_code=201)
+async def create_bookmark(body: BookmarkBody, user: dict = Depends(current_user)):
+    nid = oid(body.novel_id, "novel id")
+    cid = oid(body.chapter_id, "chapter id")
+    chapter = await db.chapters.find_one({"_id": cid, "novel_id": nid})
+    if not chapter:
+        raise HTTPException(404, "Chapter not found")
+
+    position = float(body.position_seconds)
+    # Tapping the bookmark button twice in a row should not create two rows.
+    near = await db.audio_bookmarks.find_one(
+        {
+            "user_id": user["_id"],
+            "chapter_id": cid,
+            "position_seconds": {
+                "$gte": position - BOOKMARK_DEDUPE_SECONDS,
+                "$lte": position + BOOKMARK_DEDUPE_SECONDS,
+            },
+        }
+    )
+    if near:
+        return bookmark_out(near, chapter)
+
+    doc = AudioBookmark(
+        user_id=str(user["_id"]),
+        novel_id=body.novel_id,
+        chapter_id=body.chapter_id,
+        position_seconds=position,
+    ).to_mongo()
+    doc["user_id"] = user["_id"]
+    doc["novel_id"] = nid
+    doc["chapter_id"] = cid
+    result = await db.audio_bookmarks.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return bookmark_out(doc, chapter)
+
+
+@api_router.get("/me/novels/{novel_id}/bookmarks")
+async def list_bookmarks(novel_id: str, user: dict = Depends(current_user)):
+    nid = oid(novel_id, "novel id")
+    rows = (
+        await db.audio_bookmarks.find({"user_id": user["_id"], "novel_id": nid})
+        .sort([("created_at", DESCENDING)])
+        .to_list(500)
+    )
+    chapters = await db.chapters.find({"novel_id": nid}).to_list(5000)
+    by_id = {str(c["_id"]): c for c in chapters}
+    return [bookmark_out(row, by_id.get(str(row["chapter_id"]))) for row in rows]
+
+
+@api_router.delete("/me/bookmarks/{bookmark_id}")
+async def delete_bookmark(bookmark_id: str, user: dict = Depends(current_user)):
+    result = await db.audio_bookmarks.delete_one(
+        {"_id": oid(bookmark_id, "bookmark id"), "user_id": user["_id"]}
+    )
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Bookmark not found")
+    return {"deleted": True}
+
+
+# ---------------------------------------------------------------- spoiler-safe catch-up
+@api_router.get("/me/novels/{novel_id}/catchup")
+async def novel_catchup(novel_id: str, user: dict = Depends(current_user)):
+    nid = oid(novel_id, "novel id")
+    empty = {
+        "available": False,
+        "last_listened_at": None,
+        "days_since": None,
+        "through_chapter": None,
+        "text": "",
+    }
+    progress = await db.listening_progress.find_one({"user_id": user["_id"], "novel_id": nid})
+    if not progress:
+        return empty
+
+    away = days_since(progress.get("updated_at"))
+    completions = await db.chapter_completions.find(
+        {"user_id": user["_id"], "novel_id": nid}
+    ).to_list(5000)
+    # The chapter currently in progress is never summarised — that would spoil it.
+    current = progress.get("chapter_id")
+    completed_ids = [c["chapter_id"] for c in completions if c["chapter_id"] != current]
+    if not completed_ids:
+        return {**empty, "last_listened_at": progress.get("updated_at"), "days_since": away}
+
+    chapters = (
+        await db.chapters.find({"_id": {"$in": completed_ids}, "recap_text": {"$nin": ["", None]}})
+        .sort([("chapter_number", ASCENDING)])
+        .to_list(5000)
+    )
+    recent = chapters[-CATCHUP_MAX_CHAPTERS:]
+
+    selected: List[dict] = []
+    words = 0
+    for chapter in reversed(recent):
+        recap = (chapter.get("recap_text") or "").strip()
+        if not recap:
+            continue
+        count = len(recap.split())
+        if selected and words + count > CATCHUP_MAX_WORDS:
+            break
+        selected.append(chapter)
+        words += count
+        if words >= CATCHUP_MIN_WORDS:
+            break
+    selected.reverse()
+
+    text = " ".join((c.get("recap_text") or "").strip() for c in selected).strip()
+    return {
+        "available": bool(text) and (away or 0) >= CATCHUP_MIN_DAYS,
+        "last_listened_at": progress.get("updated_at"),
+        "days_since": away,
+        "through_chapter": selected[-1].get("chapter_number") if selected else None,
+        "text": f"Previously… {text}" if text else "",
+    }
+
+
+# ---------------------------------------------------------------- analytics
+@api_router.post("/events", status_code=202)
+async def track_event(body: EventBody, user: Optional[dict] = Depends(optional_user)):
+    if body.event not in ALLOWED_EVENTS:
+        raise HTTPException(400, "Unknown event")
+    properties = dict(list((body.properties or {}).items())[:20])
+    doc = {
+        "user_id": user["_id"] if user else None,
+        "event": body.event,
+        "novel_id": oid(body.novel_id, "novel id") if body.novel_id else None,
+        "chapter_id": oid(body.chapter_id, "chapter id") if body.chapter_id else None,
+        "properties": properties,
+        "created_at": now_utc(),
+    }
+    await db.analytics_events.insert_one(doc)
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- community requests
 @api_router.get("/requests")
 async def list_requests(
@@ -858,6 +1171,57 @@ async def pro_features():
             {"title": "Unlimited downloads", "description": "Keep entire volumes offline with no chapter cap."},
         ],
     }
+
+
+# ---------------------------------------------------------------- push notifications
+push_client = httpx.AsyncClient(
+    base_url=PUSH_BASE_URL,
+    headers={"X-Push-Key": PUSH_KEY},
+    timeout=10.0,
+)
+
+
+@api_router.post("/register-push", status_code=201)
+async def register_push(body: RegisterPushBody, user: dict = Depends(current_user)):
+    # The user id always comes from the bearer token — never from the request body.
+    payload = {**body.model_dump(), "user_id": str(user["_id"])}
+    await db.push_tokens.update_one(
+        {"user_id": user["_id"], "device_token": body.device_token},
+        {
+            "$set": {"platform": body.platform, "updated_at": now_utc()},
+            "$setOnInsert": {"created_at": now_utc()},
+        },
+        upsert=True,
+    )
+    resp = await push_client.post("/api/v1/push/users/register", json=payload)
+    if resp.status_code == 401:
+        raise HTTPException(500, "EMERGENT_PUSH_KEY missing or invalid")
+    if resp.status_code >= 500:
+        raise HTTPException(502, "Push provider unavailable")
+    resp.raise_for_status()
+    return {"status": "registered"}
+
+
+async def send_push(
+    recipients: List[str],
+    data: dict,
+    idempotency_key: Optional[str] = None,
+) -> None:
+    if not recipients:
+        return
+    if len(recipients) > 100:
+        raise ValueError("max 100 recipients per /trigger call; chunk before sending")
+    if "title" not in data or "message" not in data:
+        raise ValueError("data must include title and message")
+    payload: dict = {"recipients": recipients, "data": data}
+    if idempotency_key:
+        payload["$idempotency_key"] = idempotency_key
+    resp = await push_client.post("/api/v1/push/trigger", json=payload)
+    if resp.status_code == 401:
+        raise HTTPException(500, "EMERGENT_PUSH_KEY missing or invalid")
+    if resp.status_code >= 500:
+        raise HTTPException(502, "Push provider unavailable")
+    resp.raise_for_status()
 
 
 # ---------------------------------------------------------------- media
@@ -973,6 +1337,8 @@ async def admin_delete_novel(novel_id: str, _: dict = Depends(require_admin)):
     await db.volumes.delete_many({"novel_id": nid})
     await db.saved_novels.delete_many({"novel_id": nid})
     await db.listening_progress.delete_many({"novel_id": nid})
+    await db.chapter_completions.delete_many({"novel_id": nid})
+    await db.audio_bookmarks.delete_many({"novel_id": nid})
     result = await db.novels.delete_one({"_id": nid})
     if result.deleted_count == 0:
         raise HTTPException(404, "Novel not found")
@@ -1016,7 +1382,61 @@ async def admin_unpublish(novel_id: str, _: dict = Depends(require_admin)):
 @api_router.get("/admin/novels")
 async def admin_list_novels(_: dict = Depends(require_admin)):
     docs = await db.novels.find().sort([("created_at", DESCENDING)]).to_list(500)
-    return [novel_out(d) for d in docs]
+    return [admin_novel_out(d) for d in docs]
+
+
+@api_router.put("/admin/novels/{novel_id}/anime-mappings")
+async def admin_set_anime_mappings(
+    novel_id: str, body: AnimeMappingsBody, _: dict = Depends(require_admin)
+):
+    nid = oid(novel_id, "novel id")
+    if not await db.novels.find_one({"_id": nid}):
+        raise HTTPException(404, "Novel not found")
+
+    mappings: List[Dict[str, Any]] = []
+    for mapping in body.mappings:
+        cid = oid(mapping.continue_chapter_id, "continue_chapter_id")
+        if not await db.chapters.find_one({"_id": cid, "novel_id": nid}):
+            raise HTTPException(400, f"Chapter {mapping.continue_chapter_id} is not part of this novel")
+        mappings.append(
+            {
+                "label": mapping.label.strip(),
+                "through_episode": mapping.through_episode,
+                "continue_chapter_id": cid,
+                "note": (mapping.note or "").strip() or None,
+            }
+        )
+
+    await db.novels.update_one(
+        {"_id": nid}, {"$set": {"anime_mappings": mappings, "updated_at": now_utc()}}
+    )
+    return admin_novel_out(await db.novels.find_one({"_id": nid}))
+
+
+@api_router.get("/admin/novels/{novel_id}/cast")
+async def admin_get_cast(novel_id: str, _: dict = Depends(require_admin)):
+    nid = oid(novel_id, "novel id")
+    novel = await db.novels.find_one({"_id": nid})
+    if not novel:
+        raise HTTPException(404, "Novel not found")
+    return {
+        "novel_id": novel_id,
+        "narration_mode": novel.get("narration_mode", "single"),
+        "cast": novel.get("cast", []),
+    }
+
+
+@api_router.put("/admin/novels/{novel_id}/cast")
+async def admin_set_cast(novel_id: str, body: CastBody, _: dict = Depends(require_admin)):
+    nid = oid(novel_id, "novel id")
+    if not await db.novels.find_one({"_id": nid}):
+        raise HTTPException(404, "Novel not found")
+    cast = [member.model_dump() for member in body.cast]
+    await db.novels.update_one(
+        {"_id": nid},
+        {"$set": {"narration_mode": body.narration_mode, "cast": cast, "updated_at": now_utc()}},
+    )
+    return {"novel_id": novel_id, "narration_mode": body.narration_mode, "cast": cast}
 
 
 # ---------------------------------------------------------------- admin: volumes
@@ -1075,6 +1495,7 @@ async def admin_create_chapter(
     chapter_number: int = Form(...),
     title: str = Form(...),
     duration_seconds: int = Form(0),
+    recap_text: str = Form(""),
     audio_url: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     _: dict = Depends(require_admin),
@@ -1100,6 +1521,7 @@ async def admin_create_chapter(
         audio_file_url=url,
         duration_seconds=duration_seconds,
         file_size_bytes=size,
+        recap_text=recap_text.strip(),
     )
     doc = chapter.to_mongo()
     doc["volume_id"] = vid
@@ -1107,7 +1529,7 @@ async def admin_create_chapter(
     result = await db.chapters.insert_one(doc)
     doc["_id"] = result.inserted_id
     await recount_novel(vol["novel_id"])
-    return chapter_out(doc)
+    return admin_chapter_out(doc)
 
 
 @api_router.put("/admin/chapters/{chapter_id}")
@@ -1121,7 +1543,7 @@ async def admin_update_chapter(chapter_id: str, body: ChapterPatchBody, _: dict 
         raise HTTPException(404, "Chapter not found")
     ch = await db.chapters.find_one({"_id": cid})
     await recount_novel(ch["novel_id"])
-    return chapter_out(ch)
+    return admin_chapter_out(ch)
 
 
 @api_router.delete("/admin/chapters/{chapter_id}")
@@ -1131,6 +1553,8 @@ async def admin_delete_chapter(chapter_id: str, _: dict = Depends(require_admin)
     if not ch:
         raise HTTPException(404, "Chapter not found")
     await db.chapters.delete_one({"_id": cid})
+    await db.chapter_completions.delete_many({"chapter_id": cid})
+    await db.audio_bookmarks.delete_many({"chapter_id": cid})
     await recount_novel(ch["novel_id"])
     return {"deleted": True}
 
@@ -1152,7 +1576,44 @@ async def admin_replace_audio(
         updates["duration_seconds"] = duration_seconds
     await db.chapters.update_one({"_id": cid}, {"$set": updates})
     await recount_novel(ch["novel_id"])
-    return chapter_out(await db.chapters.find_one({"_id": cid}))
+    return admin_chapter_out(await db.chapters.find_one({"_id": cid}))
+
+
+# ---------------------------------------------------------------- admin: illustrations
+@api_router.post("/admin/chapters/{chapter_id}/illustrations", status_code=201)
+async def admin_add_illustration(
+    chapter_id: str,
+    timestamp_seconds: int = Form(...),
+    caption: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    _: dict = Depends(require_admin),
+):
+    cid = oid(chapter_id, "chapter id")
+    chapter = await db.chapters.find_one({"_id": cid})
+    if not chapter:
+        raise HTTPException(404, "Chapter not found")
+    url, _size = await store_upload(file, "illustrations", chapter_id, kind="image")
+    item = {
+        "id": uuid.uuid4().hex,
+        "timestamp_seconds": max(0, timestamp_seconds),
+        "image_url": url,
+        "caption": (caption or "").strip() or None,
+    }
+    await db.chapters.update_one({"_id": cid}, {"$push": {"illustrations": item}})
+    return item
+
+
+@api_router.delete("/admin/chapters/{chapter_id}/illustrations/{illustration_id}")
+async def admin_delete_illustration(
+    chapter_id: str, illustration_id: str, _: dict = Depends(require_admin)
+):
+    cid = oid(chapter_id, "chapter id")
+    result = await db.chapters.update_one(
+        {"_id": cid}, {"$pull": {"illustrations": {"id": illustration_id}}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Chapter not found")
+    return {"deleted": True}
 
 
 # ---------------------------------------------------------------- admin: requests & users
@@ -1171,6 +1632,10 @@ async def admin_update_request(
     request_id: str, body: AdminRequestPatchBody, _: dict = Depends(require_admin)
 ):
     rid = oid(request_id, "request id")
+    previous = await db.community_requests.find_one({"_id": rid})
+    if not previous:
+        raise HTTPException(404, "Request not found")
+
     updates: Dict[str, Any] = {"updated_at": now_utc()}
     if body.status is not None:
         if body.status not in {"requested", "selected", "processing", "published", "rejected"}:
@@ -1184,10 +1649,29 @@ async def admin_update_request(
         updates["genres"] = body.genres
     if body.linked_novel_id is not None:
         updates["linked_novel_id"] = oid(body.linked_novel_id, "novel id")
-    result = await db.community_requests.update_one({"_id": rid}, {"$set": updates})
-    if result.matched_count == 0:
-        raise HTTPException(404, "Request not found")
-    return request_out(await db.community_requests.find_one({"_id": rid}), None)
+    await db.community_requests.update_one({"_id": rid}, {"$set": updates})
+    fresh = await db.community_requests.find_one({"_id": rid})
+
+    # Tell everyone who voted for it — they are almost certainly not in the app.
+    if body.status == "published" and previous.get("status") != "published":
+        voters = [str(v) for v in previous.get("voters", [])]
+        linked = fresh.get("linked_novel_id")
+        action_url = f"/novel/{linked}" if linked else "/requests"
+        for start in range(0, len(voters), 100):
+            try:
+                await send_push(
+                    recipients=voters[start : start + 100],
+                    data={
+                        "title": f"{previous.get('title', 'Your request')} is ready",
+                        "message": "The novel you voted for is now available.",
+                        "action_url": action_url,
+                    },
+                    idempotency_key=f"request-published-{request_id}-{start}",
+                )
+            except Exception as exc:
+                logger.warning("Push failed (non-blocking): %s", exc)
+
+    return request_out(fresh, None)
 
 
 @api_router.delete("/admin/requests/community/{request_id}")
@@ -1310,6 +1794,83 @@ async def seed_demo_novel() -> None:
     logger.info("Seeded demo novel %s", nid)
 
 
+DEMO_RECAPS = [
+    "Kaito died on a Tokyo crosswalk and woke in Aureth, where a dying star bound its memory to "
+    "him moments after the last Star Sage was executed for treason.",
+    "Hiding in the ruined observatory, Kaito signed a moonlight contract with the star-spirit Vela "
+    "and traded a year of his life for the first outlawed constellation glyph.",
+    "The royal inquisitors named Kaito a heretic, so Vela burned his old name away — the sky now "
+    "answers only to the Sage who forgot who he was.",
+]
+DEMO_ILLUSTRATIONS = [
+    (0, "Kaito wakes beneath the falling stars", "https://images.pexels.com/photos/1257860/pexels-photo-1257860.jpeg"),
+    (95, "The ruined observatory of Aureth", "https://images.pexels.com/photos/816608/pexels-photo-816608.jpeg"),
+]
+DEMO_CAST = [
+    {"character": "Kaito", "provider": "in_house", "voice_id": "ll_kaito_01", "voice_label": "Ren (young male)"},
+    {"character": "Vela", "provider": "in_house", "voice_id": "ll_vela_01", "voice_label": "Suzu (ethereal female)"},
+    {"character": "Narrator", "provider": "in_house", "voice_id": "ll_narr_01", "voice_label": "Kenji (warm baritone)"},
+]
+
+
+async def seed_demo_extras() -> None:
+    """Backfill the demo novel with anime mappings, cast, recaps and illustrations.
+
+    Idempotent: only writes fields that are still empty, so admin edits are never clobbered.
+    """
+    novel = await db.novels.find_one({"title": "Reincarnated as the Last Star Sage"})
+    if not novel:
+        return
+    chapters = (
+        await db.chapters.find({"novel_id": novel["_id"]})
+        .sort([("chapter_number", ASCENDING)])
+        .to_list(100)
+    )
+    if not chapters:
+        return
+
+    novel_set: Dict[str, Any] = {}
+    if not novel.get("anime_mappings"):
+        novel_set["anime_mappings"] = [
+            {
+                "label": "Finished the anime (Season 1)",
+                "through_episode": 12,
+                "continue_chapter_id": chapters[min(1, len(chapters) - 1)]["_id"],
+                "note": "Season 1 ends mid-volume 1 — start here to skip what you already watched.",
+            },
+            {
+                "label": "Saw the movie only",
+                "through_episode": None,
+                "continue_chapter_id": chapters[-1]["_id"],
+                "note": "The film compresses the observatory arc; jump straight to the fallout.",
+            },
+        ]
+    if not novel.get("cast"):
+        novel_set["cast"] = DEMO_CAST
+        novel_set["narration_mode"] = "full_cast"
+    if novel_set:
+        novel_set["updated_at"] = now_utc()
+        await db.novels.update_one({"_id": novel["_id"]}, {"$set": novel_set})
+
+    for index, chapter in enumerate(chapters):
+        updates: Dict[str, Any] = {}
+        if not (chapter.get("recap_text") or "").strip() and index < len(DEMO_RECAPS):
+            updates["recap_text"] = DEMO_RECAPS[index]
+        if index == 0 and not chapter.get("illustrations"):
+            updates["illustrations"] = [
+                {
+                    "id": uuid.uuid4().hex,
+                    "timestamp_seconds": seconds,
+                    "image_url": url,
+                    "caption": caption,
+                }
+                for seconds, caption, url in DEMO_ILLUSTRATIONS
+            ]
+        if updates:
+            await db.chapters.update_one({"_id": chapter["_id"]}, {"$set": updates})
+    logger.info("Demo novel extras ensured")
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     await db.users.create_index([("email", ASCENDING)], unique=True)
@@ -1325,9 +1886,23 @@ async def on_startup() -> None:
     await db.saved_novels.create_index([("user_id", ASCENDING), ("novel_id", ASCENDING)], unique=True)
     await db.community_requests.create_index([("vote_count", DESCENDING)])
     await db.community_requests.create_index([("title", TEXT), ("alt_title", TEXT)])
+    await db.chapter_completions.create_index(
+        [("user_id", ASCENDING), ("chapter_id", ASCENDING)], unique=True
+    )
+    await db.chapter_completions.create_index([("user_id", ASCENDING), ("novel_id", ASCENDING)])
+    await db.audio_bookmarks.create_index(
+        [("user_id", ASCENDING), ("novel_id", ASCENDING), ("created_at", DESCENDING)]
+    )
+    await db.analytics_events.create_index([("event", ASCENDING), ("created_at", DESCENDING)])
+    await db.analytics_events.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
+    await db.analytics_events.create_index([("novel_id", ASCENDING), ("created_at", DESCENDING)])
+    await db.push_tokens.create_index(
+        [("user_id", ASCENDING), ("device_token", ASCENDING)], unique=True
+    )
 
     await seed_admin()
     await seed_demo_novel()
+    await seed_demo_extras()
 
     try:
         await run_in_threadpool(init_storage)
@@ -1338,4 +1913,5 @@ async def on_startup() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    await push_client.aclose()
     client.close()

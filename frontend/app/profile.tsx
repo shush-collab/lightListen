@@ -1,16 +1,17 @@
 import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
 import { useRouter } from "expo-router";
-import React from "react";
-import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import React, { useEffect, useState } from "react";
+import { Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { SegmentedControl } from "@/src/components/Chips";
 import { useAuth } from "@/src/context/AuthContext";
-import { useDownloads } from "@/src/context/DownloadsContext";
+import { AutoDownloadSetting, useDownloads } from "@/src/context/DownloadsContext";
 import { usePlayer } from "@/src/context/PlayerContext";
 import { useToast } from "@/src/context/ToastContext";
 import { useBottomPadding } from "@/src/hooks/use-bottom-padding";
+import { enablePush, getPushStatus } from "@/src/push";
 import { ThemeMode, useTheme } from "@/src/theme/ThemeProvider";
 import { fonts, fontSize, formatBytes, radius, spacing } from "@/src/theme/tokens";
 
@@ -20,9 +21,36 @@ export default function ProfileScreen() {
   const router = useRouter();
   const toast = useToast();
   const { user, signOut } = useAuth();
-  const { totalBytes, records } = useDownloads();
+  const { totalBytes, records, autoDownloadNext, setAutoDownloadNext } = useDownloads();
   const { stop } = usePlayer();
   const bottomPadding = useBottomPadding(false);
+
+  const [pushGranted, setPushGranted] = useState(false);
+
+  useEffect(() => {
+    void getPushStatus().then((state) => setPushGranted(state.granted));
+  }, []);
+
+  const toggleNotifications = async () => {
+    if (!user) return;
+    if (pushGranted) {
+      toast("Notifications are on — manage them in system settings", "info");
+      void Linking.openSettings();
+      return;
+    }
+    const outcome = await enablePush();
+    if (outcome === "granted") {
+      setPushGranted(true);
+      toast("Notifications on — we'll ping you when a novel you voted for lands", "success");
+    } else if (outcome === "blocked") {
+      toast("Notifications are blocked in system settings", "error");
+      void Linking.openSettings();
+    } else if (outcome === "unsupported") {
+      toast("Notifications need the installed app, not the web preview", "info");
+    } else {
+      toast("No problem — you can switch them on any time", "info");
+    }
+  };
 
   const downloadCount = Object.values(records).filter((r) => r.state === "complete").length;
   const initials = (user?.display_name || user?.email || "?").trim().charAt(0).toUpperCase();
@@ -86,6 +114,41 @@ export default function ProfileScreen() {
               { key: "dark", label: "Cinematic", icon: "moon" },
               { key: "system", label: "System", icon: "smartphone" },
             ]}
+          />
+        </View>
+
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: colors.onSurface }]}>
+            Keep upcoming chapters offline
+          </Text>
+          <SegmentedControl<"0" | "1" | "2">
+            testIDPrefix="auto-download"
+            value={String(autoDownloadNext) as "0" | "1" | "2"}
+            onChange={(key) => setAutoDownloadNext(Number(key) as AutoDownloadSetting)}
+            options={[
+              { key: "0", label: "Off" },
+              { key: "1", label: "1 chapter" },
+              { key: "2", label: "2 chapters" },
+            ]}
+          />
+          <Text style={[styles.hint, { color: colors.onSurfaceSecondary }]}>
+            Quietly caches what you are about to hear next and clears it once you have moved on.
+            Chapters you download yourself are never removed.
+          </Text>
+        </View>
+
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: colors.onSurface }]}>Notifications</Text>
+          <Row
+            testID="profile-notifications-row"
+            icon={pushGranted ? "bell" : "bell-off"}
+            title={pushGranted ? "Notifications are on" : "Turn on notifications"}
+            subtitle={
+              pushGranted
+                ? "You'll hear when a novel you voted for is published"
+                : "Get told when a novel you voted for is ready"
+            }
+            onPress={() => void toggleNotifications()}
           />
         </View>
 
@@ -225,6 +288,7 @@ const styles = StyleSheet.create({
   planText: { fontFamily: fonts.medium, fontSize: fontSize.sm - 1 },
   section: { gap: spacing.sm },
   sectionTitle: { fontFamily: fonts.display, fontSize: fontSize.lg, marginBottom: spacing.xs },
+  hint: { fontFamily: fonts.regular, fontSize: fontSize.sm, lineHeight: 18 },
   row: {
     flexDirection: "row",
     alignItems: "center",

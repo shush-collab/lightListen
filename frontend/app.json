@@ -22,11 +22,13 @@
       },
       "edgeToEdgeEnabled": true,
       "package": "com.emergent.lnplayerapp.bjb9ol",
+      "googleServicesFile": "./google-services.json",
       "permissions": [
         "INTERNET",
         "WAKE_LOCK",
         "FOREGROUND_SERVICE",
-        "FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+        "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        "POST_NOTIFICATIONS"
       ]
     },
     "web": {
@@ -36,6 +38,7 @@
     },
     "plugins": [
       "expo-router",
+      "expo-notifications",
       [
         "expo-splash-screen",
         {

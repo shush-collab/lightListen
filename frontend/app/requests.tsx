@@ -16,11 +16,14 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { api } from "@/src/api/client";
 import type { CommunityRequest } from "@/src/api/types";
+import { track } from "@/src/analytics";
 import { SegmentedControl } from "@/src/components/Chips";
 import { StatusBadge } from "@/src/components/StatusBadge";
 import { EmptyState } from "@/src/components/States";
+import { useAuth } from "@/src/context/AuthContext";
 import { useToast } from "@/src/context/ToastContext";
 import { useBottomPadding } from "@/src/hooks/use-bottom-padding";
+import { enablePush, hasBeenPrompted } from "@/src/push";
 import { useTheme } from "@/src/theme/ThemeProvider";
 import { fonts, fontSize, radius, spacing } from "@/src/theme/tokens";
 
@@ -31,6 +34,7 @@ export default function RequestsScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const toast = useToast();
+  const { user } = useAuth();
   const bottomPadding = useBottomPadding(false);
 
   const [tab, setTab] = useState<Tab>("all");
@@ -76,10 +80,25 @@ export default function RequestsScreen() {
         return exists ? prev.map((i) => (i.id === updated.id ? updated : i)) : [updated, ...prev];
       });
       toast(request.has_voted ? "You already voted for this" : "Vote counted", "success");
+      track("request_voted", { properties: { request_id: request.id, title: request.title } });
+      void maybeOfferNotifications();
     } catch {
       toast("Could not register your vote", "error");
     }
   };
+
+  /**
+   * Notification permission is asked here rather than on first launch — voting is the
+   * moment a "your novel is ready" push actually becomes useful.
+   */
+  const maybeOfferNotifications = useCallback(async () => {
+    if (!user) return;
+    if (await hasBeenPrompted()) return;
+    const outcome = await enablePush();
+    if (outcome === "granted") {
+      toast("We'll notify you the moment it is published", "success");
+    }
+  }, [user, toast]);
 
   const createRequest = async () => {
     const title = query.trim();
@@ -93,6 +112,8 @@ export default function RequestsScreen() {
       setAltTitle("");
       setQuery("");
       toast(`“${created.title}” submitted`, "success");
+      track("request_submitted", { properties: { request_id: created.id, title: created.title } });
+      void maybeOfferNotifications();
       await load();
     } catch (err) {
       toast(err instanceof Error ? err.message : "Could not submit request", "error");

@@ -101,3 +101,83 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+## Iteration 3 — 11 new features (chapter completions, queue, bookmarks, anime continue, illustrations, cast badge, recaps, smart/bulk downloads, analytics, push)
+
+backend:
+  - task: "Chapter completion tracking (POST /api/me/chapters/{id}/complete, GET /api/me/novels/{id}/completed)"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    needs_retesting: true
+  - task: "Timestamp bookmarks (POST /api/me/bookmarks with 3s dedupe, GET /api/me/novels/{id}/bookmarks, DELETE /api/me/bookmarks/{id})"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    needs_retesting: true
+  - task: "Spoiler-safe catch-up (GET /api/me/novels/{id}/catchup) — never summarises the in-progress chapter, gated by CATCHUP_MIN_DAYS=3"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    needs_retesting: true
+  - task: "Anime mappings admin CRUD (PUT /api/admin/novels/{id}/anime-mappings) + public exposure via novel_out"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    needs_retesting: true
+  - task: "Cast manifest (GET/PUT /api/admin/novels/{id}/cast) — public only exposes narration_mode + cast_count, never voice_id"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    needs_retesting: true
+  - task: "Chapter illustrations (POST/DELETE /api/admin/chapters/{id}/illustrations) + timeline-sorted public output"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    needs_retesting: true
+  - task: "Analytics events (POST /api/events) — allowlist of 10 event names, 400 on unknown, optional auth"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    needs_retesting: true
+  - task: "Push token registration (POST /api/register-push)"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    needs_retesting: true
+  - task: "Demo seed extras (seed_demo_extras) — recaps, illustrations, cast, anime mappings backfilled idempotently"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    needs_retesting: true
+
+frontend:
+  - task: "Novel detail: anime-continue block, cast badge, catch-up card, volume bulk-download sheet, completed chapter ticks"
+    implemented: true
+    working: "NA"
+    file: "/app/frontend/app/novel/[id].tsx"
+    needs_retesting: true
+  - task: "Player: bookmark add + bookmarks sheet, synced illustration button/modal, chapter complete on finish"
+    implemented: true
+    working: "NA"
+    file: "/app/frontend/app/player.tsx"
+    needs_retesting: true
+  - task: "Shared download queue + smart next-chapter downloads + auto-download setting in Profile"
+    implemented: true
+    working: "NA"
+    file: "/app/frontend/src/context/DownloadsContext.tsx, /app/frontend/app/profile.tsx"
+    needs_retesting: true
+
+metadata:
+  test_sequence: 3
+  run_ui: true
+
+test_plan:
+  current_focus:
+    - "All 11 new feature endpoints (backend)"
+    - "Novel detail + player UI for the new features (frontend web preview)"
+  test_all: false
+  test_priority: "high_first"
+
+agent_communication:
+    -agent: "main"
+    -message: "Fixed the only tsc error (notification handler in app/_layout.tsx) and added seed_demo_extras so the demo novel carries anime mappings, full-cast manifest, per-chapter recaps and one illustration on chapter 1. tsc + eslint are clean. Nothing else changed. Please regression-test the 11 new features end to end. Downloads are native-only: on the web preview useDownloads().supported is false, so bulk/smart download UI should degrade gracefully rather than crash."

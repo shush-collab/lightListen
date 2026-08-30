@@ -19,8 +19,25 @@ export type Novel = {
   play_count: number;
   chapter_count: number;
   total_duration_seconds: number;
+  anime_mappings: AnimeMapping[];
+  narration_mode: string;
+  cast_count: number;
   created_at?: string;
   updated_at?: string;
+};
+
+export type AnimeMapping = {
+  label: string;
+  through_episode?: number | null;
+  continue_chapter_id: string | null;
+  note?: string | null;
+};
+
+export type Illustration = {
+  id: string;
+  timestamp_seconds: number;
+  image_url: string;
+  caption?: string | null;
 };
 
 export type Chapter = {
@@ -32,6 +49,7 @@ export type Chapter = {
   audio_file_url: string;
   duration_seconds: number;
   file_size_bytes: number;
+  illustrations?: Illustration[];
 };
 
 export type Volume = {
@@ -82,3 +100,21 @@ export type CommunityRequest = {
 };
 
 export type ProFeature = { title: string; description: string };
+
+export type Bookmark = {
+  id: string;
+  novel_id: string;
+  chapter_id: string;
+  position_seconds: number;
+  chapter_number?: number | null;
+  chapter_title?: string | null;
+  created_at?: string;
+};
+
+export type CatchUp = {
+  available: boolean;
+  last_listened_at?: string | null;
+  days_since?: number | null;
+  through_chapter?: number | null;
+  text: string;
+};

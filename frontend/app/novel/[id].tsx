@@ -14,16 +14,18 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { api, resolveMediaUrl } from "@/src/api/client";
-import type { Chapter, NovelDetail } from "@/src/api/types";
+import type { AnimeMapping, CatchUp, Chapter, NovelDetail } from "@/src/api/types";
+import { track } from "@/src/analytics";
 import { ChapterRow } from "@/src/components/ChapterRow";
 import { ChipRow } from "@/src/components/Chips";
+import { Sheet } from "@/src/components/Sheet";
 import { ErrorState } from "@/src/components/States";
 import { useDownloads } from "@/src/context/DownloadsContext";
 import { usePlayer, usePlayerStatus } from "@/src/context/PlayerContext";
 import { useToast } from "@/src/context/ToastContext";
 import { useBottomPadding } from "@/src/hooks/use-bottom-padding";
 import { useTheme } from "@/src/theme/ThemeProvider";
-import { fonts, fontSize, formatDuration, radius, spacing } from "@/src/theme/tokens";
+import { fonts, fontSize, formatBytes, formatDuration, radius, spacing } from "@/src/theme/tokens";
 
 const HERO_HEIGHT = 340;
 
@@ -33,9 +35,9 @@ export default function NovelDetailScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const toast = useToast();
-  const { playChapter, chapter: activeChapter } = usePlayer();
+  const { playChapter, chapter: activeChapter, completionTick } = usePlayer();
   const { playing } = usePlayerStatus();
-  const { download, supported } = useDownloads();
+  const { download, downloadMany, supported, records } = useDownloads();
   const bottomPadding = useBottomPadding(false);
 
   const [detail, setDetail] = useState<NovelDetail | null>(null);
@@ -44,15 +46,26 @@ export default function NovelDetailScreen() {
   const [volumeId, setVolumeId] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [completedIds, setCompletedIds] = useState<string[]>([]);
+  const [catchUp, setCatchUp] = useState<CatchUp | null>(null);
+  const [recapOpen, setRecapOpen] = useState(false);
+  const [volumeSheet, setVolumeSheet] = useState(false);
   const scrollY = useRef(new Animated.Value(0)).current;
 
   const load = useCallback(async () => {
     if (!id) return;
     setError(null);
     try {
-      const data = await api.novel(id);
+      const [data, completed, recap] = await Promise.all([
+        api.novel(id),
+        api.completedChapters(id).catch(() => ({ chapter_ids: [] as string[] })),
+        api.catchup(id).catch(() => null),
+      ]);
       setDetail(data);
+      setCompletedIds(completed.chapter_ids);
+      setCatchUp(recap);
       setVolumeId((prev) => prev ?? data.volumes[0]?.id ?? null);
+      track("novel_viewed", { novel_id: id });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load this novel");
     } finally {
@@ -64,6 +77,15 @@ export default function NovelDetailScreen() {
     void load();
   }, [load]);
 
+  // A chapter finishing in the player must tick the list here too.
+  useEffect(() => {
+    if (!id || completionTick === 0) return;
+    void api
+      .completedChapters(id)
+      .then((res) => setCompletedIds(res.chapter_ids))
+      .catch(() => undefined);
+  }, [completionTick, id]);
+
   const allChapters = useMemo<Chapter[]>(
     () => (detail ? detail.volumes.flatMap((v) => v.chapters) : []),
     [detail],
@@ -73,6 +95,41 @@ export default function NovelDetailScreen() {
     if (detail.volumes.length <= 1) return allChapters;
     return detail.volumes.find((v) => v.id === volumeId)?.chapters ?? [];
   }, [detail, volumeId, allChapters]);
+
+  const selectedVolume = useMemo(
+    () => detail?.volumes.find((v) => v.id === volumeId) ?? null,
+    [detail, volumeId],
+  );
+  const completedSet = useMemo(() => new Set(completedIds), [completedIds]);
+  const animeMappings = useMemo(
+    () => (detail?.novel.anime_mappings ?? []).filter((m) => Boolean(m.continue_chapter_id)),
+    [detail],
+  );
+  const chapterLabel = useCallback(
+    (chapterId?: string | null) => {
+      const found = allChapters.find((c) => c.id === chapterId);
+      return found ? `chapter ${found.chapter_number}` : "the recommended chapter";
+    },
+    [allChapters],
+  );
+  const estimatedBytes = useMemo(
+    () =>
+      visibleChapters.reduce(
+        (sum, c) => sum + (c.file_size_bytes || c.duration_seconds * 16000),
+        0,
+      ),
+    [visibleChapters],
+  );
+  const volumeProgress = useMemo(() => {
+    const tracked = visibleChapters
+      .map((c) => records[c.id])
+      .filter((r): r is NonNullable<typeof r> => Boolean(r));
+    return {
+      active: tracked.filter((r) => r.state === "queued" || r.state === "downloading").length,
+      done: tracked.filter((r) => r.state === "complete").length,
+      total: visibleChapters.length,
+    };
+  }, [visibleChapters, records]);
 
   const resumeChapterIndex = useMemo(() => {
     if (!detail?.progress) return 0;
@@ -123,12 +180,41 @@ export default function NovelDetailScreen() {
       return;
     }
     try {
-      toast(`Downloading ch. ${chapter.chapter_number}`, "info");
       await download(detail.novel, chapter);
-      toast(`Ch. ${chapter.chapter_number} saved offline`, "success");
+      toast(`Ch. ${chapter.chapter_number} added to downloads`, "info");
     } catch (err) {
       toast(err instanceof Error ? err.message : "Download failed", "error");
     }
+  };
+
+  const startVolumeDownload = async () => {
+    setVolumeSheet(false);
+    if (!detail) return;
+    if (!supported) {
+      toast("Downloads work in the mobile app, not the web preview", "info");
+      return;
+    }
+    try {
+      await downloadMany(detail.novel, visibleChapters, "manual");
+      toast(`Queued ${visibleChapters.length} chapters`, "success");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Download failed", "error");
+    }
+  };
+
+  const continueFromAnime = (mapping: AnimeMapping) => {
+    if (!mapping.continue_chapter_id) return;
+    track("anime_continue_used", {
+      novel_id: detail?.novel.id,
+      chapter_id: mapping.continue_chapter_id,
+      properties: { label: mapping.label },
+    });
+    startPlayback(mapping.continue_chapter_id);
+  };
+
+  const openRecap = () => {
+    setRecapOpen((open) => !open);
+    if (!recapOpen && detail) track("catchup_used", { novel_id: detail.novel.id });
   };
 
   const headerOpacity = scrollY.interpolate({
@@ -250,6 +336,18 @@ export default function NovelDetailScreen() {
           <Stat icon="headphones" label={`${novel.play_count} plays`} />
         </View>
 
+        {novel.narration_mode === "full_cast" ? (
+          <View
+            testID="novel-cast-badge"
+            style={[styles.castBadge, { backgroundColor: colors.brandTertiary }]}
+          >
+            <Feather name="users" size={13} color={colors.onBrandTertiary} />
+            <Text style={[styles.castText, { color: colors.onBrandTertiary }]}>
+              Full-cast narration · {novel.cast_count} voices
+            </Text>
+          </View>
+        ) : null}
+
         <View style={styles.ctaRow}>
           <Pressable
             testID="novel-play-button"
@@ -278,6 +376,83 @@ export default function NovelDetailScreen() {
             />
           </Pressable>
         </View>
+
+        {catchUp?.available ? (
+          <View
+            testID="novel-catchup-card"
+            style={[
+              styles.catchup,
+              { backgroundColor: colors.surfaceSecondary, borderColor: colors.brand },
+            ]}
+          >
+            <View style={styles.catchupTop}>
+              <Feather name="rotate-ccw" size={15} color={colors.brand} />
+              <Text style={[styles.catchupTitle, { color: colors.onSurface }]}>
+                It&apos;s been {Math.max(1, Math.round(catchUp.days_since ?? 0))} days
+              </Text>
+            </View>
+            {recapOpen ? (
+              <Text testID="novel-catchup-text" style={[styles.catchupText, { color: colors.onSurfaceSecondary }]}>
+                {catchUp.text}
+              </Text>
+            ) : (
+              <Text style={[styles.catchupText, { color: colors.onSurfaceSecondary }]}>
+                Want a spoiler-safe reminder of where you left off
+                {catchUp.through_chapter ? ` (through chapter ${catchUp.through_chapter})` : ""}?
+              </Text>
+            )}
+            <View style={styles.catchupRow}>
+              <Pressable
+                testID="novel-catchup-button"
+                onPress={openRecap}
+                style={[styles.catchupPrimary, { backgroundColor: colors.brand }]}
+              >
+                <Text style={[styles.catchupPrimaryText, { color: colors.onBrand }]}>
+                  {recapOpen ? "Hide recap" : "Catch me up"}
+                </Text>
+              </Pressable>
+              <Pressable
+                testID="novel-catchup-continue"
+                onPress={() => startPlayback()}
+                style={[styles.catchupSecondary, { borderColor: colors.borderStrong }]}
+              >
+                <Text style={[styles.catchupSecondaryText, { color: colors.onSurface }]}>Continue</Text>
+              </Pressable>
+            </View>
+          </View>
+        ) : null}
+
+        {animeMappings.length > 0 ? (
+          <View style={styles.block} testID="novel-anime-block">
+            <Text style={[styles.blockTitle, { color: colors.onSurface }]}>Watched the anime?</Text>
+            {animeMappings.map((mapping) => (
+              <Pressable
+                key={`${mapping.label}-${mapping.continue_chapter_id}`}
+                testID={`novel-anime-${mapping.label.toLowerCase().replace(/\s+/g, "-")}`}
+                onPress={() => continueFromAnime(mapping)}
+                style={({ pressed }) => [
+                  styles.animeRow,
+                  {
+                    backgroundColor: colors.surfaceSecondary,
+                    borderColor: colors.border,
+                    opacity: pressed ? 0.85 : 1,
+                  },
+                ]}
+              >
+                <View style={styles.animeBody}>
+                  <Text style={[styles.animeLabel, { color: colors.onSurface }]}>
+                    {mapping.label}
+                    {mapping.through_episode ? ` · through ep. ${mapping.through_episode}` : ""}
+                  </Text>
+                  <Text style={[styles.animeNote, { color: colors.onSurfaceSecondary }]}>
+                    {mapping.note ?? `Continue from ${chapterLabel(mapping.continue_chapter_id)}`}
+                  </Text>
+                </View>
+                <Feather name="arrow-right" size={16} color={colors.brand} />
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
 
         <View style={styles.block}>
           <Text
@@ -318,7 +493,31 @@ export default function NovelDetailScreen() {
         ) : null}
 
         <View style={styles.chapterBlock}>
-          <Text style={[styles.blockTitle, { color: colors.onSurface }]}>Chapters</Text>
+          <View style={styles.chapterHeader}>
+            <Text style={[styles.blockTitle, { color: colors.onSurface }]}>
+              {selectedVolume && detail.volumes.length > 1
+                ? `Volume ${selectedVolume.volume_number}`
+                : "Chapters"}
+            </Text>
+            {visibleChapters.length > 0 ? (
+              <Pressable
+                testID="novel-download-volume"
+                onPress={() => setVolumeSheet(true)}
+                style={[styles.volumeBtn, { borderColor: colors.brand }]}
+              >
+                <Feather
+                  name={volumeProgress.active > 0 ? "loader" : "download"}
+                  size={13}
+                  color={colors.brand}
+                />
+                <Text style={[styles.volumeBtnText, { color: colors.brand }]}>
+                  {volumeProgress.active > 0
+                    ? `Downloading ${volumeProgress.done} / ${volumeProgress.total}`
+                    : "Download volume"}
+                </Text>
+              </Pressable>
+            ) : null}
+          </View>
           {visibleChapters.length === 0 ? (
             <Text style={[styles.description, { color: colors.onSurfaceSecondary }]}>
               No chapters published yet.
@@ -331,6 +530,7 @@ export default function NovelDetailScreen() {
                 index={index}
                 isCurrent={activeChapter?.id === chapter.id}
                 isPlaying={playing}
+                isCompleted={completedSet.has(chapter.id)}
                 onPress={() => startPlayback(chapter.id)}
                 onDownload={() => void startDownload(chapter)}
               />
@@ -338,6 +538,40 @@ export default function NovelDetailScreen() {
           )}
         </View>
       </Animated.ScrollView>
+
+      <Sheet
+        testID="volume-download-sheet"
+        visible={volumeSheet}
+        onClose={() => setVolumeSheet(false)}
+        title={
+          selectedVolume && detail.volumes.length > 1
+            ? `Download Volume ${selectedVolume.volume_number}?`
+            : "Download all chapters?"
+        }
+      >
+        <Text style={[styles.sheetText, { color: colors.onSurfaceSecondary }]}>
+          {visibleChapters.length} chapter{visibleChapters.length === 1 ? "" : "s"} · ~
+          {formatBytes(estimatedBytes)}
+          {supported
+            ? ". They download one at a time and anything already offline is skipped."
+            : ". Downloads only work in the installed app, not the web preview."}
+        </Text>
+        <Pressable
+          testID="volume-download-confirm"
+          onPress={() => void startVolumeDownload()}
+          style={[styles.sheetPrimary, { backgroundColor: colors.brand }]}
+        >
+          <Feather name="download" size={16} color={colors.onBrand} />
+          <Text style={[styles.sheetPrimaryText, { color: colors.onBrand }]}>Download</Text>
+        </Pressable>
+        <Pressable
+          testID="volume-download-cancel"
+          onPress={() => setVolumeSheet(false)}
+          style={styles.sheetCancel}
+        >
+          <Text style={[styles.sheetCancelText, { color: colors.onSurfaceSecondary }]}>Cancel</Text>
+        </Pressable>
+      </Sheet>
     </View>
   );
 }
@@ -431,4 +665,87 @@ const styles = StyleSheet.create({
   description: { fontFamily: fonts.regular, fontSize: fontSize.base, lineHeight: 21 },
   more: { fontFamily: fonts.semibold, fontSize: fontSize.base, marginTop: spacing.xs },
   chapterBlock: { paddingHorizontal: spacing.lg, marginTop: spacing.xl },
+  chapterHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.md,
+  },
+  volumeBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    height: 36,
+    paddingHorizontal: spacing.md,
+    borderRadius: radius.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    marginBottom: spacing.xs,
+  },
+  volumeBtnText: { fontFamily: fonts.semibold, fontSize: fontSize.sm },
+  castBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    alignSelf: "flex-start",
+    marginHorizontal: spacing.lg,
+    marginTop: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xs,
+    borderRadius: radius.pill,
+  },
+  castText: { fontFamily: fonts.medium, fontSize: fontSize.sm },
+  catchup: {
+    marginHorizontal: spacing.lg,
+    marginTop: spacing.lg,
+    padding: spacing.lg,
+    borderRadius: radius.md,
+    borderLeftWidth: 3,
+    gap: spacing.sm,
+  },
+  catchupTop: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
+  catchupTitle: { fontFamily: fonts.semibold, fontSize: fontSize.lg },
+  catchupText: { fontFamily: fonts.regular, fontSize: fontSize.base, lineHeight: 21 },
+  catchupRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.xs },
+  catchupPrimary: {
+    flex: 1,
+    minHeight: 44,
+    borderRadius: radius.pill,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  catchupPrimaryText: { fontFamily: fonts.semibold, fontSize: fontSize.base },
+  catchupSecondary: {
+    flex: 1,
+    minHeight: 44,
+    borderRadius: radius.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  catchupSecondaryText: { fontFamily: fonts.semibold, fontSize: fontSize.base },
+  animeRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+    padding: spacing.md,
+    borderRadius: radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    marginTop: spacing.xs,
+  },
+  animeBody: { flex: 1, gap: 2 },
+  animeLabel: { fontFamily: fonts.semibold, fontSize: fontSize.base },
+  animeNote: { fontFamily: fonts.regular, fontSize: fontSize.sm, lineHeight: 18 },
+  sheetText: { fontFamily: fonts.regular, fontSize: fontSize.base, lineHeight: 21 },
+  sheetPrimary: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: spacing.sm,
+    minHeight: 48,
+    borderRadius: radius.pill,
+    marginTop: spacing.md,
+  },
+  sheetPrimaryText: { fontFamily: fonts.semibold, fontSize: fontSize.lg },
+  sheetCancel: { minHeight: 44, alignItems: "center", justifyContent: "center" },
+  sheetCancelText: { fontFamily: fonts.medium, fontSize: fontSize.base },
 });

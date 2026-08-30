@@ -1,0 +1,51 @@
+{
+  "summary": "Iteration 2 — security-fix verification + regression. Backend: 109/109 pytest cases pass (63 new security tests in test_security.py + 46 existing regression tests). All SEC-001 (draft chapters/play/save now 404 for non-admins; /play now 401 without JWT; /save 404 on unpublished; admin still 200 on drafts), SEC-002 (safe_regex on /novels?q, /requests?q, /admin/users?q — 8 metachar payloads incl. '(a+)+$', '.*', '^Rein', '[', '\\\\', ')(' , '?*+', '(?:x)' all respond <5s with valid 200 JSON; anchored escaped duplicate-title dedupe still works with 'Regex (Test) [One]' and '.*' does not collide with unrelated titles), SEC-003 (validate_storage_path rejects prefix-mismatch, %-encoding, empty/./.. segments, backslash traversal, >400 char paths — either 400 direct-rejection or 404 after upstream URL normalisation; genuine PNG cover uploads round-trip with image/* Content-Type, X-Content-Type-Options: nosniff, and 206 + Content-Range on Range requests), upload hardening (POST /admin/novels/{id}/cover rejects text/html and application/pdf with 415, accepts PNG; POST /admin/volumes/{id}/chapters rejects text/plain with 415, accepts audio/mpeg; audio_url form-field path unchanged), and login-enumeration fixes (unknown email + wrong password both return identical 401 'Invalid email or password'; duplicate signup still 409, <8-char password still 422) all verified. CORS allow_credentials=False does NOT break the Expo web preview — GET with Origin header still works. Frontend regression (mobile 390x844): login as reader@lightlisten.app → Home (Continue listening + New this week + mini-player), Explore search 'Star' filters correctly, Novel detail → tap 'Resume ch. 1' calls POST /novels/{id}/play → HTTP 200 (with bearer token) → full-screen /player opens with scrubber/speed/sleep controls playing, novel-save-button toggles + 'Saved to your library' toast + appears in Library > Saved, mini-player persistent across Home/Novel/Library/Requests/Profile, Community requests page loads (test-generated metachar titles like 'Regex (Test) [One]' visible confirming SEC-002 end-to-end), Profile theme switch Cinematic highlights and persists across page reload, logout returns to /login. Zero console errors during the flow, zero 4xx/5xx API calls, zero 401s from /novels/{id}/play. Existing test file /app/backend/tests/test_catalog.py::test_novel_play_increments was updated to send a reader JWT (intentional behaviour change from SEC-001 — noted here, not as a bug) and a new test_novel_play_without_auth_401 was added. Two pre-existing cosmetic React-Native-Web deprecation warnings from iteration 1 (shadow* + pointerEvents on /app/frontend/app/novel/[id].tsx) still present — unchanged, not blocking.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": [
+      {"component": "novel/[id].tsx (artWrap style)", "issue": "(Pre-existing, unchanged from iteration 1) Uses deprecated shadow* style props. Reference: /app/frontend/app/novel/[id].tsx:394-399"},
+      {"component": "novel/[id].tsx (Animated.View sticky header)", "issue": "(Pre-existing, unchanged from iteration 1) Uses deprecated pointerEvents prop on <Animated.View>. Reference: /app/frontend/app/novel/[id].tsx:163"}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_security.py (new — 63 security-focused cases)",
+    "/app/backend/tests/test_catalog.py (updated — /play now uses reader JWT + added test_novel_play_without_auth_401)",
+    "/app/backend/tests/test_auth.py",
+    "/app/backend/tests/test_library.py",
+    "/app/backend/tests/test_requests.py",
+    "/app/backend/tests/test_admin.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Optional / carried over from iteration 1) Migrate shadow* props to boxShadow and move pointerEvents into style on /app/frontend/app/novel/[id].tsx to silence the two RN-Web deprecation warnings."
+  ],
+  "critical_code_review_comments": [
+    "safe_regex() correctly uses re.escape + 80-char cap and is applied to /novels?q, /requests?q, /admin/users?q and the anchored duplicate-title check in POST /requests — all four Mongo $regex sites are now safe from injection and catastrophic backtracking.",
+    "validate_storage_path() correctly rejects prefix mismatch, %, empty/./.. segments and >400-char paths, and normalises backslashes to forward slashes before segment inspection — path traversal is blocked at the API layer even when upstream URL normalisation would already have absorbed some payloads.",
+    "store_upload() now streams with a per-kind size cap (audio 200MB / image 10MB), enforces the AUDIO_TYPES / IMAGE_TYPES allowlist (returns 415 otherwise) and derives the file extension from the validated content type rather than from the client filename — the previous filename-based extension trust is gone.",
+    "Media response handler clamps outbound Content-Type to SERVABLE_TYPES (else application/octet-stream) and always sets X-Content-Type-Options: nosniff on both the 200 full and 206 Range responses — verified live: PNG cover fetched back with Content-Type: image/*, nosniff header present, and Content-Range on Range requests.",
+    "GET /api/novels/{id}/chapters now uses Depends(optional_user) and 404s on unpublished novels for anon and non-admin users while still 200 for admin — matches the pre-existing /api/novels/{id} behaviour, no leaks.",
+    "POST /api/novels/{id}/play now Depends(current_user) AND its $filter includes status='published' so an authenticated user hitting a draft still gets 404.",
+    "POST /api/novels/{id}/save short-circuits with 404 when the novel isn't published, preventing draft leakage via the saved list.",
+    "Login timing: unknown-email branch now runs a bcrypt compare against DUMMY_PASSWORD_HASH before raising 401 with identical detail 'Invalid email or password' — both known-bad-password and unknown-email paths verified to return the same 401 body.",
+    "CORS: allow_credentials=False + allow_origins=['*'] is the correct combination for a bearer-token API. Verified the Expo web preview at ln-player-app.preview.emergentagent.com is not affected — Origin-tagged GETs still succeed.",
+    "server.py is 1341 lines — still a monolith; pre-existing comment from iteration 1 stands: consider splitting into routers for maintainability. Not blocking."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_security.py (new)",
+    "/app/backend/tests/test_catalog.py (updated: /play test now sends reader JWT because SEC-001 requires auth; added test_novel_play_without_auth_401)"
+  ],
+  "success_rate": {"backend": "100% (109/109)", "frontend": "100% of tested flows"},
+  "seed_data_creation": "Several TEST_-prefixed community requests + one 'Regex (Test) [One] <hex>' request + one '.*_<hex>' request were created during SEC-002 testing (safe to leave — they exercise the anchored-escaped dedupe path). Several TEST_SEC_Draft_<hex> draft novels were created and cleaned up by the fixture teardown. A tiny PNG cover was uploaded and stored under lightlisten/covers/<novel_id>/<uuid>.png.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "All security fixes for iteration 2 are in place and covered by /app/backend/tests/test_security.py (63 cases). Two path-traversal payloads ('../lightlisten/x' and 'lightlisten/./x') are absorbed by upstream URL normalisation before hitting validate_storage_path, so they surface as 404 rather than 400 — the test_media_bad_path_rejected assertion allows either status because both mean the traversal did not read a file. Frontend /play calls succeed with the bearer token (no regression from making /play authenticated). The Expo web preview is served at https://ln-player-app.preview.emergentagent.com and is unaffected by CORS allow_credentials=False (bearer-token auth, no cookies).",
+  "rca_of_issue": "N/A — this iteration verified fixes, no new issues surfaced."
+}

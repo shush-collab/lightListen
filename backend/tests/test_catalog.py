@@ -78,12 +78,17 @@ class TestCatalog:
         assert len(chapters) >= 3
         assert chapters[0]["chapter_number"] == 1
 
-    def test_novel_play_increments(self, api_client, demo_novel):
+    def test_novel_play_increments(self, api_client, reader_headers, demo_novel):
+        # Behaviour intentionally tightened by SEC-001: /play now requires a JWT.
         before = api_client.get(f"{API}/novels/{demo_novel['id']}").json()["novel"]["play_count"]
-        r = api_client.post(f"{API}/novels/{demo_novel['id']}/play")
+        r = requests.post(f"{API}/novels/{demo_novel['id']}/play", headers=reader_headers)
         assert r.status_code == 200
         after = api_client.get(f"{API}/novels/{demo_novel['id']}").json()["novel"]["play_count"]
         assert after == before + 1
+
+    def test_novel_play_without_auth_401(self, api_client, demo_novel):
+        r = api_client.post(f"{API}/novels/{demo_novel['id']}/play")
+        assert r.status_code == 401
 
     def test_pro_features_no_auth(self, api_client):
         r = api_client.get(f"{API}/pro/features")

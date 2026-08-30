@@ -88,6 +88,21 @@ Stack root
 - Frontend: all flows verified in the 390x844 mobile web preview (auth, home, explore, novel,
   player, mini-player persistence, library, requests, profile, theme switch + persistence)
 
+## Security audit (2026-08-30, iteration 2)
+Read-only audit verdict was FAIL → all findings fixed and re-verified (109/109 backend tests).
+
+| ID | Severity | Issue | Fix |
+|---|---|---|---|
+| SEC-001 | HIGH | Draft (unpublished) novels leaked via `GET /api/novels/{id}/chapters`; `play`/`save` acted on drafts | Chapters endpoint takes optional auth and 404s on drafts for non-admins; `POST /play` now requires a logged-in user and only counts published novels; `POST /save` only accepts published novels |
+| SEC-002 | MEDIUM | Unescaped user input in Mongo `$regex` (injection + ReDoS) on `/novels?q`, `/requests?q`, `/admin/users?q`, duplicate-title check | `safe_regex()` with `re.escape` + 80-char cap everywhere |
+| SEC-003 | MEDIUM | Path traversal potential in the public `GET /api/media/{path}` proxy | `validate_storage_path()` enforces the `lightlisten/` prefix, rejects `.`/`..`/empty segments, `%`, backslashes and >400-char paths |
+| P3 | LOW | Unbounded uploads / trusted client content type | `store_upload()` streams with size caps (audio 200 MB, image 10 MB), content-type allowlist (415 otherwise), extension derived from the validated type; media responses clamp the served type to the allowlist and add `X-Content-Type-Options: nosniff` |
+| P3 | LOW | Login user-enumeration via timing | Dummy bcrypt compare for unknown emails, identical 401 message |
+| P3 | LOW | CORS `*` with `allow_credentials=True` | `allow_credentials=False` (auth is bearer-token, no cookies) |
+
+Accepted for MVP (tracked in the backlog): stateless refresh tokens have no server-side
+revocation list, and signup still returns 409 on a duplicate email for usability.
+
 ## Backlog
 ### P0 (next)
 - Bulk/volume download queue with a foreground-service notification (needs a native build)

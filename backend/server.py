@@ -7,6 +7,7 @@ plus admin content management endpoints (X-Admin-Key + admin JWT).
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -311,6 +312,54 @@ def oid(value: str, label: str = "id") -> ObjectId:
         raise HTTPException(400, f"Invalid {label}")
 
 
+MAX_QUERY_LEN = 80
+
+
+def safe_regex(value: str, anchored: bool = False) -> dict:
+    """Escapes user input before it reaches a Mongo `$regex` (injection + ReDoS)."""
+    trimmed = (value or "").strip()[:MAX_QUERY_LEN]
+    pattern = re.escape(trimmed)
+    if anchored:
+        pattern = f"^{pattern}$"
+    return {"$regex": pattern, "$options": "i"}
+
+
+MAX_AUDIO_BYTES = 200 * 1024 * 1024
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+AUDIO_TYPES = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/ogg": ".ogg",
+    "application/octet-stream": ".mp3",
+}
+IMAGE_TYPES = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+}
+SERVABLE_TYPES = set(AUDIO_TYPES) | set(IMAGE_TYPES)
+
+
+def validate_storage_path(path: str) -> str:
+    """Only well-formed paths inside this app's object prefix may be proxied."""
+    normalized = (path or "").replace("\\", "/")
+    segments = normalized.split("/")
+    if (
+        not normalized.startswith(f"{APP_NAME}/")
+        or "%" in normalized
+        or any(seg in {"", ".", ".."} for seg in segments)
+        or len(normalized) > 400
+    ):
+        raise HTTPException(400, "Invalid media path")
+    return normalized
+
+
 def hash_password(password: str) -> str:
     if len(password.encode("utf-8")) > 72:
         raise HTTPException(400, "Password must be at most 72 UTF-8 bytes")
@@ -322,6 +371,11 @@ def password_ok(password: str, stored_hash: str) -> bool:
         return bcrypt.checkpw(password.encode(), stored_hash.encode())
     except (ValueError, TypeError):
         return False
+
+
+# Compared against when the email is unknown so login timing does not reveal
+# whether an account exists.
+DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"timing-equalising-placeholder", bcrypt.gensalt(rounds=12)).decode()
 
 
 def make_token(subject: str, role: str, kind: str, lifetime: timedelta) -> str:
@@ -485,7 +539,10 @@ async def signup(body: SignupBody):
 async def login(body: LoginBody):
     email = str(body.email).lower().strip()
     user = await db.users.find_one({"email": email})
-    if not user or not password_ok(body.password, user["password_hash"]):
+    if not user:
+        password_ok(body.password, DUMMY_PASSWORD_HASH)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
+    if not password_ok(body.password, user["password_hash"]):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
     return {**token_pair(user), "user": user_out(user)}
 
@@ -540,7 +597,7 @@ async def list_novels(
     if genre:
         query["genres"] = genre
     if q:
-        rx = {"$regex": q.strip(), "$options": "i"}
+        rx = safe_regex(q)
         query["$or"] = [{"title": rx}, {"alt_title": rx}, {"author": rx}]
     sort_spec = {
         "new": [("created_at", DESCENDING)],
@@ -598,16 +655,25 @@ async def novel_detail(novel_id: str, user: Optional[dict] = Depends(optional_us
 
 
 @api_router.get("/novels/{novel_id}/chapters")
-async def novel_chapters(novel_id: str):
+async def novel_chapters(novel_id: str, user: Optional[dict] = Depends(optional_user)):
     nid = oid(novel_id, "novel id")
+    novel = await db.novels.find_one({"_id": nid})
+    if not novel:
+        raise HTTPException(404, "Novel not found")
+    if novel.get("status") != "published" and not (user and user.get("role") == "admin"):
+        raise HTTPException(404, "Novel not found")
     docs = await db.chapters.find({"novel_id": nid}).sort([("chapter_number", ASCENDING)]).to_list(5000)
     return [chapter_out(d) for d in docs]
 
 
 @api_router.post("/novels/{novel_id}/play")
-async def mark_play(novel_id: str, user: Optional[dict] = Depends(optional_user)):
+async def mark_play(novel_id: str, _: dict = Depends(current_user)):
     nid = oid(novel_id, "novel id")
-    await db.novels.update_one({"_id": nid}, {"$inc": {"play_count": 1}})
+    result = await db.novels.update_one(
+        {"_id": nid, "status": "published"}, {"$inc": {"play_count": 1}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Novel not found")
     return {"ok": True}
 
 
@@ -684,7 +750,7 @@ async def saved_novels(user: dict = Depends(current_user)):
 @api_router.post("/novels/{novel_id}/save")
 async def save_novel(novel_id: str, user: dict = Depends(current_user)):
     nid = oid(novel_id, "novel id")
-    if not await db.novels.find_one({"_id": nid}):
+    if not await db.novels.find_one({"_id": nid, "status": "published"}):
         raise HTTPException(404, "Novel not found")
     await db.saved_novels.update_one(
         {"user_id": user["_id"], "novel_id": nid},
@@ -709,7 +775,7 @@ async def list_requests(
 ):
     query: Dict[str, Any] = {}
     if q and q.strip():
-        rx = {"$regex": q.strip(), "$options": "i"}
+        rx = safe_regex(q)
         query["$or"] = [{"title": rx}, {"alt_title": rx}]
     docs = (
         await db.community_requests.find(query)
@@ -724,9 +790,7 @@ async def list_requests(
 @api_router.post("/requests", status_code=201)
 async def create_request(body: RequestCreateBody, user: dict = Depends(current_user)):
     title = body.title.strip()
-    existing = await db.community_requests.find_one(
-        {"title": {"$regex": f"^{title}$", "$options": "i"}}
-    )
+    existing = await db.community_requests.find_one({"title": safe_regex(title, anchored=True)})
     if existing:
         await db.community_requests.update_one(
             {"_id": existing["_id"]},
@@ -799,11 +863,16 @@ async def pro_features():
 # ---------------------------------------------------------------- media
 @api_router.get("/media/{path:path}")
 async def media(path: str, request: Request):
+    safe_path = validate_storage_path(path)
     try:
-        data, ctype = await run_in_threadpool(get_object, path)
+        data, raw_ctype = await run_in_threadpool(get_object, safe_path)
     except Exception as exc:  # storage returns 500 for missing objects
-        logger.warning("media fetch failed for %s: %s", path, exc)
+        logger.warning("media fetch failed for %s: %s", safe_path, exc)
         raise HTTPException(404, "File not found")
+
+    ctype = (raw_ctype or "").split(";")[0].strip().lower()
+    if ctype not in SERVABLE_TYPES:
+        ctype = "application/octet-stream"
 
     total = len(data)
     range_header = request.headers.get("range")
@@ -826,6 +895,7 @@ async def media(path: str, request: Request):
                 "Accept-Ranges": "bytes",
                 "Content-Length": str(len(chunk)),
                 "Cache-Control": "public, max-age=86400",
+                "X-Content-Type-Options": "nosniff",
             },
         )
     return Response(
@@ -835,19 +905,42 @@ async def media(path: str, request: Request):
             "Accept-Ranges": "bytes",
             "Content-Length": str(total),
             "Cache-Control": "public, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
 
-async def store_upload(file: UploadFile, folder: str, owner: str) -> tuple:
-    data = await file.read()
+async def store_upload(file: UploadFile, folder: str, owner: str, kind: str) -> tuple:
+    """Streams an upload to object storage with a size cap and a content-type allowlist."""
+    allowed = AUDIO_TYPES if kind == "audio" else IMAGE_TYPES
+    limit = MAX_AUDIO_BYTES if kind == "audio" else MAX_IMAGE_BYTES
+    ctype = (
+        file.content_type
+        or mimetypes.guess_type(file.filename or "")[0]
+        or "application/octet-stream"
+    ).split(";")[0].strip().lower()
+    if ctype not in allowed:
+        raise HTTPException(415, f"Unsupported file type: {ctype}")
+
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(413, f"File too large (max {limit // (1024 * 1024)} MB)")
+        chunks.append(chunk)
+    data = b"".join(chunks)
     if not data:
         raise HTTPException(400, "Empty file")
-    ext = (Path(file.filename or "").suffix or "").lower() or ".bin"
-    ctype = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+
+    # Extension is derived from the validated content type, never from the client filename.
+    ext = allowed[ctype]
     path = f"{APP_NAME}/{folder}/{owner}/{uuid.uuid4().hex}{ext}"
     await run_in_threadpool(put_object, path, data, ctype)
-    return f"/api/media/{path}", len(data)
+    return f"/api/media/{path}", total
 
 
 # ---------------------------------------------------------------- admin: novels
@@ -893,7 +986,7 @@ async def admin_upload_cover(
     nid = oid(novel_id, "novel id")
     if not await db.novels.find_one({"_id": nid}):
         raise HTTPException(404, "Novel not found")
-    url, _size = await store_upload(file, "covers", novel_id)
+    url, _size = await store_upload(file, "covers", novel_id, kind="image")
     await db.novels.update_one({"_id": nid}, {"$set": {"cover_image_url": url, "updated_at": now_utc()}})
     return {"cover_image_url": url}
 
@@ -993,7 +1086,7 @@ async def admin_create_chapter(
 
     size = 0
     if file is not None:
-        url, size = await store_upload(file, "audio", volume_id)
+        url, size = await store_upload(file, "audio", volume_id, kind="audio")
     elif audio_url:
         url = audio_url
     else:
@@ -1053,7 +1146,7 @@ async def admin_replace_audio(
     ch = await db.chapters.find_one({"_id": cid})
     if not ch:
         raise HTTPException(404, "Chapter not found")
-    url, size = await store_upload(file, "audio", str(ch["volume_id"]))
+    url, size = await store_upload(file, "audio", str(ch["volume_id"]), kind="audio")
     updates: Dict[str, Any] = {"audio_file_url": url, "file_size_bytes": size}
     if duration_seconds is not None:
         updates["duration_seconds"] = duration_seconds
@@ -1109,7 +1202,7 @@ async def admin_delete_request(request_id: str, _: dict = Depends(require_admin)
 async def admin_list_users(q: Optional[str] = None, _: dict = Depends(require_admin)):
     query: Dict[str, Any] = {}
     if q:
-        rx = {"$regex": q.strip(), "$options": "i"}
+        rx = safe_regex(q)
         query["$or"] = [{"email": rx}, {"display_name": rx}]
     docs = await db.users.find(query).sort([("created_at", DESCENDING)]).to_list(500)
     return [user_out(d) for d in docs]
@@ -1140,7 +1233,7 @@ app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
